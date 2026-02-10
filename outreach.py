@@ -73,43 +73,52 @@ STEP_TYPE = {
 
 def template_a(name: str, company: str, title: str) -> tuple[str, str]:
     """Step 1 — Initial outreach."""
-    subject = f"Quick question for {company}"
-    body = (
-        f"Hi {name},\n\n"
-        f"I came across {company} and was impressed by what your team is doing. "
-        f"As {title}, you likely deal with [pain point] on a regular basis.\n\n"
-        f"We've helped similar companies solve this — would you be open to a "
-        f"brief 15‑minute call this week?\n\n"
-        f"Best regards"
-    )
+    subject = "Henry Roof Coatings vs. Current Supplier"
+    body = f"""{name},
+
+I'm Alex with Carlisle, the commercial roofing manufacturer.
+
+Do you offer roof coatings for customers who can't afford full commercial roof replacement?
+
+If you already do, I'd love to compare Henry Roof Coatings with your current supplier—just to keep them honest.
+
+Coatings can help you close more deals and drive more revenue with a budget-friendly option.
+
+Can I stop by your office next week?
+
+Thanks,"""
     return subject, body
 
 
 def template_b(name: str, company: str, title: str) -> tuple[str, str]:
     """Step 3 — Follow‑up after call attempt."""
-    subject = f"Following up — {company}"
-    body = (
-        f"Hi {name},\n\n"
-        f"I wanted to follow up on my earlier message. I understand things get busy, "
-        f"so I'll keep this short.\n\n"
-        f"I'd love to share a quick case study showing how we helped a company "
-        f"similar to {company} achieve [specific result]. Would that be helpful?\n\n"
-        f"Looking forward to hearing from you."
-    )
+    subject = "Re: Henry Roof Coatings vs. Current Supplier"
+    body = f"""{name},
+
+Circling back on the note below.
+
+Are you currently walking away from leads that can't get budget approval for a full tear-off?
+
+Henry Roof Coatings can turn those lost bids into profitable projects with much lower labor costs.
+
+I'll be in your area next Tuesday—do you have 5 minutes for me to drop off some info?
+
+Thanks,"""
     return subject, body
 
 
 def template_c(name: str, company: str, title: str) -> tuple[str, str]:
     """Step 6 — Final break‑up email."""
-    subject = f"Closing the loop — {company}"
-    body = (
-        f"Hi {name},\n\n"
-        f"I've reached out a few times and haven't heard back, so I'll assume "
-        f"the timing isn't right.\n\n"
-        f"If things change down the road, feel free to reach out. I'm always happy "
-        f"to chat about how we can help {company}.\n\n"
-        f"Wishing you all the best."
-    )
+    subject = "Re: Henry Roof Coatings vs. Current Supplier"
+    body = f"""{name},
+
+I haven't heard back, so I'll assume you're all set with your current coating strategy for now.
+
+I won't keep following up, but keep us in mind next time you need a competitive number to keep your current supplier honest.
+
+Feel free to reach out if you have a specific project you need a spec for.
+
+Best,"""
     return subject, body
 
 
@@ -118,6 +127,36 @@ TEMPLATE_MAP = {
     3: template_b,
     6: template_c,
 }
+
+# ──────────────────── MANUAL TASK SCRIPTS ─────────────────────
+
+def get_manual_script(step: int, name: str) -> str:
+    """Return the script text for a manual task step, with name substituted."""
+    scripts = {
+        2: f"""Opener: "{name}, this is Alex with Henry, the roof coating manufacturer."
+(Pause)
+"Do you offer roof coatings to your customers?"
+
+IF YES: "Do you use us... Henry, or someone else?"
+  -> "Gotcha. The reason I'm calling is because I am the roof coating rep
+     in Texas. I wanted to see if we can get coffee or lunch to discuss
+     working together. I think I can help you save money, time, and
+     headaches compared to your current supplier."
+
+IF NO: "Would you like to get lunch to learn more about roof coatings so
+  that you can offer this to your customers who can't afford a roof
+  replacement? This could be a new revenue stream for you to win
+  commercial coating jobs." """,
+
+        4: f"""Hey {name}, Alex with Carlisle here. Sent you a few emails about Henry Coatings. Just wanted to float this to the top of your inbox in case you have a project stuck on budget. Let me know if you want to chat. Thanks.""",
+
+        5: f"""{name},
+
+I've been trying to reach you via email and phone regarding Henry Roof Coatings. I'm not trying to spam you—I just know I can help you close the owners who can't afford a full replacement right now. We can offer a 20-year NDL warranty at a fraction of the cost of a tear-off. Is this a better place to chat, or should I try your office again?
+
+Thanks,""",
+    }
+    return scripts.get(step, "")
 
 # ─────────────────────────── HELPERS ──────────────────────────
 
@@ -253,14 +292,24 @@ def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
     step = int(row["step"])
     task = STEP_TYPE.get(step, "task").upper()
 
-    cprint(f"\n{'─' * 50}", Fore.CYAN)
+    cprint(f"\n{'─' * 60}", Fore.CYAN)
     cprint(f"  MANUAL TASK: {task}", Fore.CYAN)
     cprint(f"  Name    : {row['name']}", Fore.WHITE)
     cprint(f"  Title   : {row['title']}", Fore.WHITE)
     cprint(f"  Company : {row['company']}", Fore.WHITE)
     cprint(f"  Phone   : {row['phone']}", Fore.WHITE)
     cprint(f"  Notes   : {row['notes']}", Fore.WHITE)
-    cprint(f"{'─' * 50}", Fore.CYAN)
+    cprint(f"{'─' * 60}", Fore.CYAN)
+
+    # Display the script for this manual step
+    script = get_manual_script(step, row["name"])
+    if script:
+        cprint(f"\n  {'═' * 56}", Fore.GREEN)
+        cprint(f"  SCRIPT:", Fore.GREEN)
+        cprint(f"  {'═' * 56}", Fore.GREEN)
+        for line in script.strip().splitlines():
+            cprint(f"  {line}", Fore.WHITE)
+        cprint(f"  {'═' * 56}\n", Fore.GREEN)
 
     while True:
         result = input(
