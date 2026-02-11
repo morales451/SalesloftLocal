@@ -245,6 +245,37 @@ def email_exists(df: pd.DataFrame, email: str) -> bool:
     return email.strip().lower() in df["email"].str.strip().str.lower().values
 
 
+def display_notes_log(notes: str) -> None:
+    """Print the notes log in a readable format."""
+    if not notes or not str(notes).strip():
+        cprint("  Notes   : (none)", Fore.WHITE)
+        return
+    entries = [e.strip() for e in str(notes).split("|") if e.strip()]
+    cprint(f"  {'─' * 40}", Fore.MAGENTA)
+    cprint(f"  NOTES LOG ({len(entries)} entries):", Fore.MAGENTA)
+    for entry in entries:
+        cprint(f"    {entry}", Fore.WHITE)
+    cprint(f"  {'─' * 40}", Fore.MAGENTA)
+
+
+def prompt_for_notes(df: pd.DataFrame, idx: int, step: int) -> pd.DataFrame:
+    """Ask the user for notes after an action. Appends as a timestamped log entry."""
+    note = input(
+        f"{Fore.YELLOW}  Add notes (or press Enter to skip): {Style.RESET_ALL}"
+    ).strip()
+    if note:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        existing = str(df.at[idx, "notes"]).strip()
+        entry = f"[{timestamp} S{step}] {note}"
+        if existing:
+            df.at[idx, "notes"] = f"{existing} | {entry}"
+        else:
+            df.at[idx, "notes"] = entry
+        save_contacts(df)
+        cprint(f"  Note saved.", Fore.GREEN)
+    return df
+
+
 # ─────────────────────── CORE ACTIONS ─────────────────────────
 
 def handle_email_step(
@@ -256,6 +287,7 @@ def handle_email_step(
     """Send an email for the given contact row. Returns updated df, count, success."""
     row = df.loc[idx]
     step = int(row["step"])
+    display_notes_log(row["notes"])
     template_fn = TEMPLATE_MAP.get(step)
     if template_fn is None:
         cprint(f"  No email template for step {step}; skipping.", Fore.RED)
@@ -283,6 +315,7 @@ def handle_email_step(
         df.at[idx, "step"] = step + 1
     df.at[idx, "last_contact_date"] = today_str
     save_contacts(df)
+    df = prompt_for_notes(df, idx, step)
     return df, emails_sent, True
 
 
@@ -298,8 +331,8 @@ def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
     cprint(f"  Title   : {row['title']}", Fore.WHITE)
     cprint(f"  Company : {row['company']}", Fore.WHITE)
     cprint(f"  Phone   : {row['phone']}", Fore.WHITE)
-    cprint(f"  Notes   : {row['notes']}", Fore.WHITE)
     cprint(f"{'─' * 60}", Fore.CYAN)
+    display_notes_log(row["notes"])
 
     # Display the script for this manual step
     script = get_manual_script(step, row["name"])
@@ -336,6 +369,7 @@ def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
     else:
         cprint(f"  Skipped {row['name']}.", Fore.YELLOW)
 
+    df = prompt_for_notes(df, idx, step)
     save_contacts(df)
     return df
 
