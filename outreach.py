@@ -630,6 +630,152 @@ def show_status(df: pd.DataFrame) -> None:
     cprint(f"\n  Total contacts: {len(df)}", Fore.GREEN)
 
 
+# ──────────────────── DEMO MODE ───────────────────────────────
+
+DEMO_CONTACTS = [
+    {"name": "Mike Johnson", "email": "mike@demo.com", "phone": "555-9901",
+     "company": "Lone Star Roofing", "title": "Owner", "step": 6,
+     "notes": "[2026-02-03 09:15 S1] Sent intro | [2026-02-05 14:00 S2] Called, spoke briefly - busy | [2026-02-08 10:30 S3] Sent follow-up"},
+    {"name": "Carlos Rivera", "email": "carlos@demo.com", "phone": "555-9902",
+     "company": "Summit Commercial", "title": "VP of Operations", "step": 2,
+     "notes": "[2026-02-09 11:00 S1] Sent intro email"},
+    {"name": "Dana White", "email": "dana@demo.com", "phone": "555-9903",
+     "company": "AllWeather Roofing", "title": "GM", "step": 4,
+     "notes": "[2026-02-01 08:00 S1] Intro sent | [2026-02-03 13:45 S2] No answer | [2026-02-06 09:00 S3] Opened email"},
+    {"name": "Jenny Park", "email": "jenny@demo.com", "phone": "555-9904",
+     "company": "BlueSky Contractors", "title": "President", "step": 1,
+     "notes": ""},
+    {"name": "Hector Ruiz", "email": "hector@demo.com", "phone": "555-9905",
+     "company": "Texas Pro Roofing", "title": "Owner", "step": 5,
+     "notes": "[2026-01-28 10:00 S1] Intro | [2026-01-30 14:00 S2] Left VM | [2026-02-02 09:30 S3] Follow-up sent | [2026-02-04 11:00 S4] Texted"},
+]
+
+
+def demo_mode() -> None:
+    """Walk through every screen the tool produces using fake data. Nothing is saved or sent."""
+    cprint("\n╔══════════════════════════════════════════════╗", Fore.YELLOW)
+    cprint("║            DEMO MODE — Nothing is real       ║", Fore.YELLOW)
+    cprint("║   No emails sent. No CSV changes. Just UI.   ║", Fore.YELLOW)
+    cprint("╚══════════════════════════════════════════════╝\n", Fore.YELLOW)
+
+    # Sort by priority: Step 6 email first, then Step 3 email, manual tasks, then Step 1
+    ordered = sorted(DEMO_CONTACTS, key=lambda c: (
+        0 if STEP_TYPE.get(c["step"]) == "email" and c["step"] > 1 else
+        1 if STEP_TYPE.get(c["step"]) != "email" and c["step"] > 1 else 2,
+        -c["step"],
+    ))
+
+    fu_emails = [c for c in ordered if STEP_TYPE.get(c["step"]) == "email" and c["step"] > 1]
+    manual = [c for c in ordered if STEP_TYPE.get(c["step"]) != "email" and c["step"] > 1]
+    new_emails = [c for c in ordered if c["step"] == 1]
+
+    # ── Review screen ──
+    cprint("╔══════════════════════════════════════╗", Fore.CYAN)
+    cprint("║       TODAY'S OUTREACH SUMMARY       ║", Fore.CYAN)
+    cprint("╠══════════════════════════════════════╣", Fore.CYAN)
+    cprint(f"║  Follow‑up Emails  : {len(fu_emails):>4}            ║", Fore.WHITE)
+    cprint(f"║  Manual Tasks      : {len(manual):>4}            ║", Fore.WHITE)
+    cprint(f"║  New Outreach      : {len(new_emails):>4}            ║", Fore.WHITE)
+    cprint(f"║  Daily Email Limit : {DAILY_EMAIL_LIMIT:>4}            ║", Fore.YELLOW)
+    cprint(f"║  Total Actions     : {len(ordered):>4}            ║", Fore.WHITE)
+    cprint("╚══════════════════════════════════════╝", Fore.CYAN)
+
+    input(f"\n{Fore.YELLOW}  Press Enter to start the demo walkthrough …{Style.RESET_ALL}")
+
+    action_num = 0
+
+    # ── Follow-up emails ──
+    if fu_emails:
+        cprint("\n── FOLLOW‑UP EMAILS ──", Fore.CYAN)
+    for c in fu_emails:
+        action_num += 1
+        step = c["step"]
+        cprint(f"\n  [{action_num}/{len(ordered)}] {c['name']} — {c['company']} (Step {step})", Fore.CYAN)
+        display_notes_log(c["notes"])
+        template_fn = TEMPLATE_MAP.get(step)
+        if template_fn:
+            subject, body = template_fn(c["name"], c["company"], c["title"])
+            cprint(f"\n  Subject: {subject}", Fore.GREEN)
+            cprint(f"  To: {c['email']}", Fore.GREEN)
+            cprint(f"  {'─' * 40}", Fore.WHITE)
+            for line in body.splitlines():
+                cprint(f"  {line}", Fore.WHITE)
+            cprint(f"  {'─' * 40}", Fore.WHITE)
+        cprint(f"  [DEMO] Email would be sent here.", Fore.YELLOW)
+        _demo_notes_prompt(c)
+        input(f"{Fore.YELLOW}  Press Enter for next action …{Style.RESET_ALL}")
+
+    # ── Manual tasks ──
+    if manual:
+        cprint("\n── MANUAL FOLLOW‑UP TASKS ──", Fore.CYAN)
+    for c in manual:
+        action_num += 1
+        step = c["step"]
+        task = STEP_TYPE.get(step, "task").upper()
+        cprint(f"\n  [{action_num}/{len(ordered)}]", Fore.CYAN)
+        cprint(f"  {'─' * 60}", Fore.CYAN)
+        cprint(f"  MANUAL TASK: {task}", Fore.CYAN)
+        cprint(f"  Name    : {c['name']}", Fore.WHITE)
+        cprint(f"  Title   : {c['title']}", Fore.WHITE)
+        cprint(f"  Company : {c['company']}", Fore.WHITE)
+        cprint(f"  Phone   : {c['phone']}", Fore.WHITE)
+        cprint(f"  {'─' * 60}", Fore.CYAN)
+        display_notes_log(c["notes"])
+
+        script = get_manual_script(step, c["name"])
+        if script:
+            cprint(f"\n  {'═' * 56}", Fore.GREEN)
+            cprint(f"  SCRIPT:", Fore.GREEN)
+            cprint(f"  {'═' * 56}", Fore.GREEN)
+            for line in script.strip().splitlines():
+                cprint(f"  {line}", Fore.WHITE)
+            cprint(f"  {'═' * 56}", Fore.GREEN)
+
+        cprint(f"\n  [DEMO] You would see: Result? (y=Done / n=Skip / stop=Remove)", Fore.YELLOW)
+        _demo_notes_prompt(c)
+        input(f"{Fore.YELLOW}  Press Enter for next action …{Style.RESET_ALL}")
+
+    # ── New outreach ──
+    if new_emails:
+        cprint("\n── NEW OUTREACH EMAILS ──", Fore.CYAN)
+    for c in new_emails:
+        action_num += 1
+        step = c["step"]
+        cprint(f"\n  [{action_num}/{len(ordered)}] {c['name']} — {c['company']} (Step {step})", Fore.CYAN)
+        display_notes_log(c["notes"])
+        template_fn = TEMPLATE_MAP.get(step)
+        if template_fn:
+            subject, body = template_fn(c["name"], c["company"], c["title"])
+            cprint(f"\n  Subject: {subject}", Fore.GREEN)
+            cprint(f"  To: {c['email']}", Fore.GREEN)
+            cprint(f"  {'─' * 40}", Fore.WHITE)
+            for line in body.splitlines():
+                cprint(f"  {line}", Fore.WHITE)
+            cprint(f"  {'─' * 40}", Fore.WHITE)
+        cprint(f"  [DEMO] Email would be sent here.", Fore.YELLOW)
+        _demo_notes_prompt(c)
+        if action_num < len(ordered):
+            input(f"{Fore.YELLOW}  Press Enter for next action …{Style.RESET_ALL}")
+
+    # ── Summary ──
+    cprint(f"\n{'═' * 50}", Fore.GREEN)
+    cprint(f"  DEMO COMPLETE", Fore.GREEN)
+    cprint(f"  In a real run, {len(fu_emails) + len(new_emails)} emails would have been sent.", Fore.GREEN)
+    cprint(f"  {len(manual)} manual tasks would have been prompted.", Fore.GREEN)
+    cprint(f"  Notes you entered would be saved to contacts.csv.", Fore.GREEN)
+    cprint(f"{'═' * 50}\n", Fore.GREEN)
+
+
+def _demo_notes_prompt(contact: dict) -> None:
+    """Show the notes prompt in demo mode (input is discarded)."""
+    note = input(
+        f"{Fore.YELLOW}  Add notes (or press Enter to skip): {Style.RESET_ALL}"
+    ).strip()
+    if note:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        cprint(f"  [DEMO] Would save: [{timestamp} S{contact['step']}] {note}", Fore.YELLOW)
+
+
 # ──────────────────── MAIN MENU ───────────────────────────────
 
 def main_menu() -> None:
@@ -648,9 +794,10 @@ def main_menu() -> None:
         cprint("  2. Add contacts manually", Fore.WHITE)
         cprint("  3. Import contacts from CSV", Fore.WHITE)
         cprint("  4. View contact status", Fore.WHITE)
-        cprint("  5. Exit", Fore.WHITE)
+        cprint("  5. Demo mode (test drive with fake data)", Fore.YELLOW)
+        cprint("  6. Exit", Fore.WHITE)
 
-        choice = input(f"\n{Fore.YELLOW}  Select [1-5]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.YELLOW}  Select [1-6]: {Style.RESET_ALL}").strip()
 
         if choice == "1":
             df = review_and_run(df)
@@ -662,6 +809,8 @@ def main_menu() -> None:
         elif choice == "4":
             show_status(df)
         elif choice == "5":
+            demo_mode()
+        elif choice == "6":
             cprint("\n  Goodbye.\n", Fore.GREEN)
             break
         else:
