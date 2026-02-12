@@ -7,7 +7,9 @@ Reads contacts from contacts.csv, prioritizes follow-ups over new leads,
 sends emails via Outlook/Office365 SMTP, and prompts for manual tasks.
 """
 
+import copy
 import csv
+import json
 import os
 import random
 import re
@@ -42,11 +44,14 @@ THROTTLE_MIN_SECONDS = 30
 THROTTLE_MAX_SECONDS = 90
 
 CSV_PATH = Path(__file__).parent / "contacts.csv"
+UNDO_FILE = Path(__file__).parent / ".undo_history.json"
+MAX_UNDO_ENTRIES = 20
 
 CSV_COLUMNS = [
     "name", "email", "phone", "company", "title",
     "status", "step", "last_contact_date", "notes",
     "snooze_until", "created_date", "replied_date", "last_error",
+    "meeting_date", "meeting_notes",
 ]
 
 VALID_STATUSES = {"active", "paused", "replied", "not_interested", "finished"}
@@ -273,6 +278,85 @@ def display_notes_log(notes: str) -> None:
     cprint(f"  {'─' * 40}", Fore.MAGENTA)
 
 
+def save_undo(df: pd.DataFrame, idx: int, description: str) -> None:
+    """Save a snapshot of a contact row before modifying it."""
+    row_data = df.loc[idx].to_dict()
+    # Convert numpy types to native Python for JSON
+    for k, v in row_data.items():
+        if hasattr(v, "item"):
+            row_data[k] = v.item()
+        else:
+            row_data[k] = str(v) if not isinstance(v, (str, int, float)) else v
+
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "description": description,
+        "idx": int(idx),
+        "snapshot": row_data,
+    }
+
+    history = []
+    if UNDO_FILE.exists():
+        try:
+            history = json.loads(UNDO_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            history = []
+    history.append(entry)
+    history = history[-MAX_UNDO_ENTRIES:]
+    UNDO_FILE.write_text(json.dumps(history, indent=2))
+
+
+def undo_last_action(df: pd.DataFrame) -> pd.DataFrame:
+    """Restore the last modified contact to its previous state."""
+    if not UNDO_FILE.exists():
+        cprint("\n  Nothing to undo.", Fore.YELLOW)
+        return df
+
+    try:
+        history = json.loads(UNDO_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        cprint("\n  Undo history is corrupted.", Fore.RED)
+        return df
+
+    if not history:
+        cprint("\n  Nothing to undo.", Fore.YELLOW)
+        return df
+
+    entry = history[-1]
+    snap = entry["snapshot"]
+
+    cprint(f"\n── UNDO LAST ACTION ──\n", Fore.CYAN)
+    cprint(f"  Action : {entry['description']}", Fore.WHITE)
+    cprint(f"  Time   : {entry['timestamp']}", Fore.WHITE)
+    cprint(f"  Contact: {snap.get('name', '?')} ({snap.get('email', '?')})", Fore.WHITE)
+    cprint(f"  Will restore to: Step {snap.get('step', '?')}, Status: {snap.get('status', '?')}", Fore.WHITE)
+
+    confirm = input(f"\n{Fore.YELLOW}  Type UNDO to confirm, or anything else to cancel: {Style.RESET_ALL}").strip()
+    if confirm != "UNDO":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+
+    idx = entry["idx"]
+    # Find the contact by email (idx may have shifted after deletes)
+    email = snap.get("email", "")
+    matches = df[df["email"].str.strip().str.lower() == email.strip().lower()]
+    if matches.empty:
+        cprint(f"  Contact {email} not found in CSV. May have been deleted.", Fore.RED)
+        return df
+
+    actual_idx = matches.index[0]
+    for col, val in snap.items():
+        if col in df.columns:
+            df.at[actual_idx, col] = val
+    df["step"] = pd.to_numeric(df["step"], errors="coerce").fillna(0).astype(int)
+
+    save_contacts(df)
+    history.pop()
+    UNDO_FILE.write_text(json.dumps(history, indent=2))
+    cprint(f"  Restored {snap['name']} to Step {snap['step']}, Status: {snap['status']}.", Fore.GREEN)
+    return df
+
+
 def prompt_for_notes(df: pd.DataFrame, idx: int, step: int) -> pd.DataFrame:
     """Ask the user for notes after an action. Appends as a timestamped log entry."""
     note = input(
@@ -338,6 +422,9 @@ def handle_email_step(
         Fore.GREEN,
     )
 
+    # Save undo snapshot before advancing
+    save_undo(df, idx, f"Email Step {step} to {row['name']}")
+
     # Advance contact
     today_str = datetime.now().strftime("%Y-%m-%d")
     if step >= 6:
@@ -378,15 +465,31 @@ def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
 
     while True:
         result = input(
-            f"{Fore.YELLOW}  Result? (y=Done / n=Skip / stop=Remove from list): {Style.RESET_ALL}"
+            f"{Fore.YELLOW}  Result? (y=Done / n=Skip / mtg=Meeting booked / stop=Remove): {Style.RESET_ALL}"
         ).strip().lower()
-        if result in ("y", "n", "stop"):
+        if result in ("y", "n", "stop", "mtg"):
             break
-        cprint("  Invalid input. Enter y, n, or stop.", Fore.RED)
+        cprint("  Invalid input. Enter y, n, mtg, or stop.", Fore.RED)
+
+    # Save undo snapshot before modifying
+    save_undo(df, idx, f"Manual Step {step} ({task}) for {row['name']}")
 
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    if result == "stop":
+    if result == "mtg":
+        mtg_date = input(f"{Fore.YELLOW}  Meeting date (YYYY-MM-DD): {Style.RESET_ALL}").strip()
+        mtg_note = input(f"{Fore.YELLOW}  Meeting details (location/time/topic): {Style.RESET_ALL}").strip()
+        df.at[idx, "status"] = "replied"
+        df.at[idx, "replied_date"] = today_str
+        df.at[idx, "meeting_date"] = mtg_date
+        df.at[idx, "meeting_notes"] = mtg_note
+        df.at[idx, "last_contact_date"] = today_str
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        mtg_entry = f"[{timestamp} S{step}] MEETING BOOKED {mtg_date}: {mtg_note}"
+        existing = str(row["notes"]).strip()
+        df.at[idx, "notes"] = f"{existing} | {mtg_entry}".strip(" |")
+        cprint(f"  Meeting booked with {row['name']} on {mtg_date}!", Fore.GREEN)
+    elif result == "stop":
         df.at[idx, "status"] = "not_interested"
         df.at[idx, "notes"] = f"{row['notes']} | Removed {today_str}".strip(" |")
         cprint(f"  Marked {row['name']} as not_interested.", Fore.MAGENTA)
@@ -401,7 +504,8 @@ def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
     else:
         cprint(f"  Skipped {row['name']}.", Fore.YELLOW)
 
-    df = prompt_for_notes(df, idx, step)
+    if result != "mtg":
+        df = prompt_for_notes(df, idx, step)
     save_contacts(df)
     return df
 
@@ -1086,9 +1190,10 @@ def analytics_menu(df: pd.DataFrame) -> None:
         cprint("  1. Cadence funnel", Fore.WHITE)
         cprint("  2. Activity stats (today/week)", Fore.WHITE)
         cprint("  3. Conversion rates", Fore.WHITE)
-        cprint("  4. Back to main menu", Fore.WHITE)
+        cprint("  4. Meetings booked", Fore.WHITE)
+        cprint("  5. Back to main menu", Fore.WHITE)
 
-        choice = input(f"\n{Fore.YELLOW}  Select [1-4]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.YELLOW}  Select [1-5]: {Style.RESET_ALL}").strip()
         if choice == "1":
             show_funnel(df)
         elif choice == "2":
@@ -1096,9 +1201,189 @@ def analytics_menu(df: pd.DataFrame) -> None:
         elif choice == "3":
             show_conversion_rates(df)
         elif choice == "4":
+            show_meetings(df)
+        elif choice == "5":
             break
         else:
             cprint("  Invalid choice.", Fore.RED)
+
+
+# ──────────────────── MEETINGS DASHBOARD ──────────────────────
+
+def show_meetings(df: pd.DataFrame) -> None:
+    """Display all contacts with meetings booked."""
+    has_meeting = df[df["meeting_date"].astype(str).str.strip() != ""]
+    if has_meeting.empty:
+        cprint("\n  No meetings booked yet.", Fore.YELLOW)
+        return
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    cprint("\n── MEETINGS BOOKED ──\n", Fore.CYAN)
+    cprint(f"  {'Name':<20} {'Company':<20} {'Date':<12} {'Details'}", Fore.WHITE)
+    cprint(f"  {'─' * 75}", Fore.WHITE)
+
+    for _, row in has_meeting.iterrows():
+        mtg_date = str(row["meeting_date"]).strip()
+        try:
+            dt = datetime.strptime(mtg_date, "%Y-%m-%d")
+            if dt < today:
+                color = Fore.WHITE  # past
+            elif dt == today:
+                color = Fore.GREEN  # today
+            else:
+                color = Fore.CYAN   # upcoming
+        except ValueError:
+            color = Fore.WHITE
+        cprint(
+            f"  {row['name']:<20} {row['company']:<20} {mtg_date:<12} {row['meeting_notes']}",
+            color,
+        )
+
+    upcoming = 0
+    for _, row in has_meeting.iterrows():
+        try:
+            if datetime.strptime(str(row["meeting_date"]).strip(), "%Y-%m-%d") >= today:
+                upcoming += 1
+        except ValueError:
+            pass
+    cprint(f"\n  {len(has_meeting)} total meetings ({upcoming} upcoming)", Fore.GREEN)
+
+
+# ──────────────────── DAILY RECAP ─────────────────────────────
+
+def daily_recap(df: pd.DataFrame) -> None:
+    """Generate and optionally email a summary of today's activity."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Parse notes for today's actions
+    pattern = re.compile(r"\[" + today_str + r" \d{2}:\d{2} S(\d)\] (.+?)(?:\||$)")
+    actions = []
+    for _, row in df.iterrows():
+        notes = str(row.get("notes", ""))
+        for match in pattern.finditer(notes):
+            actions.append({
+                "name": row["name"],
+                "company": row["company"],
+                "step": int(match.group(1)),
+                "action": match.group(2).strip(),
+            })
+
+    # Contacts contacted today
+    contacted_today = df[df["last_contact_date"] == today_str]
+
+    # Meetings booked
+    meetings_today = df[df["meeting_date"] == today_str]
+
+    # Build recap
+    lines = []
+    lines.append(f"═══ DAILY RECAP — {today_str} ═══")
+    lines.append("")
+    lines.append(f"Contacts worked today: {len(contacted_today)}")
+    lines.append(f"Actions logged:        {len(actions)}")
+    lines.append(f"Meetings booked today: {len(meetings_today)}")
+    lines.append("")
+
+    if actions:
+        lines.append("── Actions ──")
+        for a in actions:
+            stype = STEP_TYPE.get(a["step"], "?").upper()
+            lines.append(f"  {a['name']} ({a['company']}) — S{a['step']} {stype}: {a['action']}")
+        lines.append("")
+
+    if not meetings_today.empty:
+        lines.append("── Meetings Booked ──")
+        for _, row in meetings_today.iterrows():
+            lines.append(f"  {row['name']} ({row['company']}) — {row['meeting_notes']}")
+        lines.append("")
+
+    # Due tomorrow
+    tomorrow = next_business_day(today + timedelta(days=1))
+    due_tomorrow = 0
+    active = df[df["status"] == "active"]
+    for _, row in active.iterrows():
+        if is_due(row, tomorrow):
+            due_tomorrow += 1
+    lines.append(f"Due next business day: {due_tomorrow} contacts")
+
+    # Status summary
+    lines.append("")
+    lines.append("── Pipeline ──")
+    for status in ["active", "replied", "finished", "not_interested", "paused"]:
+        count = len(df[df["status"] == status])
+        if count > 0:
+            lines.append(f"  {status:<16} {count}")
+
+    recap_text = "\n".join(lines)
+
+    # Print to terminal
+    cprint(f"\n", Fore.CYAN)
+    for line in lines:
+        cprint(f"  {line}", Fore.WHITE)
+    cprint("", Fore.CYAN)
+
+    # Offer to email it
+    send_it = input(
+        f"\n{Fore.YELLOW}  Email this recap to yourself? (y/n): {Style.RESET_ALL}"
+    ).strip().lower()
+    if send_it == "y":
+        email_addr, password = get_credentials()
+        if not email_addr or not password:
+            cprint("  No credentials available.", Fore.RED)
+            return
+        try:
+            server = connect_smtp()
+            send_email(server, email_addr, f"Outreach Recap — {today_str}", recap_text)
+            server.quit()
+            cprint(f"  Recap sent to {email_addr}.", Fore.GREEN)
+        except Exception as exc:
+            cprint(f"  Failed to send recap: {exc}", Fore.RED)
+
+
+# ──────────────────── EXPORT ──────────────────────────────────
+
+def export_report(df: pd.DataFrame) -> None:
+    """Export contacts to a clean CSV report."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    default_name = f"outreach_export_{today_str}.csv"
+
+    cprint("\n── EXPORT CONTACTS ──\n", Fore.CYAN)
+    cprint("  1. All contacts (full data)", Fore.WHITE)
+    cprint("  2. Active contacts only", Fore.WHITE)
+    cprint("  3. Meetings booked", Fore.WHITE)
+    cprint("  4. Replied contacts", Fore.WHITE)
+    cprint("  5. Back", Fore.WHITE)
+
+    choice = input(f"\n{Fore.YELLOW}  Select [1-5]: {Style.RESET_ALL}").strip()
+
+    if choice == "1":
+        export_df = df.copy()
+        label = "all contacts"
+    elif choice == "2":
+        export_df = df[df["status"] == "active"].copy()
+        label = "active contacts"
+    elif choice == "3":
+        export_df = df[df["meeting_date"].astype(str).str.strip() != ""].copy()
+        label = "meetings"
+    elif choice == "4":
+        export_df = df[df["status"] == "replied"].copy()
+        label = "replied contacts"
+    else:
+        return
+
+    if export_df.empty:
+        cprint(f"  No {label} to export.", Fore.YELLOW)
+        return
+
+    filename = input(f"  Filename [{default_name}]: ").strip() or default_name
+    export_path = Path(__file__).parent / filename
+
+    # Clean up for export — readable columns
+    export_cols = ["name", "email", "phone", "company", "title", "status", "step",
+                   "last_contact_date", "meeting_date", "meeting_notes", "notes"]
+    available_cols = [c for c in export_cols if c in export_df.columns]
+    export_df[available_cols].to_csv(export_path, index=False)
+    cprint(f"  Exported {len(export_df)} {label} to {export_path}", Fore.GREEN)
 
 
 # ──────────────────── DEMO MODE ───────────────────────────────
@@ -1272,11 +1557,14 @@ def main_menu() -> None:
         cprint(f"  {'─' * 35}", Fore.WHITE)
         cprint("  8.  View contact status", Fore.WHITE)
         cprint("  9.  Analytics & reports", Fore.WHITE)
+        cprint("  10. Daily recap", Fore.WHITE)
+        cprint("  11. Export contacts to CSV", Fore.WHITE)
+        cprint("  12. Undo last action", Fore.YELLOW)
         cprint(f"  {'─' * 35}", Fore.WHITE)
-        cprint("  10. Demo mode (test drive with fake data)", Fore.YELLOW)
+        cprint("  13. Demo mode (test drive with fake data)", Fore.YELLOW)
         cprint("  0.  Exit", Fore.WHITE)
 
-        choice = input(f"\n{Fore.YELLOW}  Select [0-10]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.YELLOW}  Select [0-13]: {Style.RESET_ALL}").strip()
 
         if choice == "1":
             df = review_and_run(df)
@@ -1298,6 +1586,12 @@ def main_menu() -> None:
         elif choice == "9":
             analytics_menu(df)
         elif choice == "10":
+            daily_recap(df)
+        elif choice == "11":
+            export_report(df)
+        elif choice == "12":
+            df = undo_last_action(df)
+        elif choice == "13":
             demo_mode()
         elif choice == "0":
             cprint("\n  Goodbye.\n", Fore.GREEN)

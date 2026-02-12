@@ -18,6 +18,12 @@ env/
 # Temp files from crash-save
 *.csv.tmp
 
+# Undo history (local state)
+.undo_history.json
+
+# Exports
+outreach_export_*.csv
+
 # IDE
 .vscode/
 .idea/
