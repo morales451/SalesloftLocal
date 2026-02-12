@@ -10,6 +10,7 @@ sends emails via Outlook/Office365 SMTP, and prompts for manual tasks.
 import csv
 import os
 import random
+import re
 import smtplib
 import sys
 import time
@@ -45,6 +46,7 @@ CSV_PATH = Path(__file__).parent / "contacts.csv"
 CSV_COLUMNS = [
     "name", "email", "phone", "company", "title",
     "status", "step", "last_contact_date", "notes",
+    "snooze_until", "created_date", "replied_date", "last_error",
 ]
 
 VALID_STATUSES = {"active", "paused", "replied", "not_interested", "finished"}
@@ -172,6 +174,10 @@ def load_contacts() -> pd.DataFrame:
         df.to_csv(CSV_PATH, index=False)
         return df
     df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
+    # Backward compat: add any missing columns
+    for col in CSV_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
     # Ensure step is int‑like
     df["step"] = pd.to_numeric(df["step"], errors="coerce").fillna(0).astype(int)
     return df
@@ -199,6 +205,15 @@ def is_due(row: pd.Series, today: datetime) -> bool:
     step = int(row["step"])
     if step < 1 or step > 6:
         return False
+    # Snooze check
+    snooze = row.get("snooze_until", "")
+    if snooze:
+        try:
+            snooze_dt = datetime.strptime(str(snooze).strip(), "%Y-%m-%d")
+            if today < snooze_dt:
+                return False
+        except ValueError:
+            pass
     last = row.get("last_contact_date", "")
     if not last and step == 1:
         return True  # brand‑new contact, step 1 is always due
@@ -294,13 +309,30 @@ def handle_email_step(
         return df, emails_sent, False
 
     subject, body = template_fn(row["name"], row["company"], row["title"])
+
+    # Preview email before sending
+    cprint(f"\n  To: {row['email']}", Fore.GREEN)
+    cprint(f"  Subject: {subject}", Fore.GREEN)
+    cprint(f"  {'─' * 40}", Fore.WHITE)
+    for line in body.splitlines():
+        cprint(f"  {line}", Fore.WHITE)
+    cprint(f"  {'─' * 40}", Fore.WHITE)
+
+    confirm = input(f"{Fore.YELLOW}  Send this email? (y/n): {Style.RESET_ALL}").strip().lower()
+    if confirm != "y":
+        cprint(f"  Skipped {row['name']}.", Fore.YELLOW)
+        return df, emails_sent, False
+
     try:
         send_email(server, row["email"], subject, body)
     except smtplib.SMTPException as exc:
         cprint(f"  SMTP error for {row['email']}: {exc}", Fore.RED)
+        df.at[idx, "last_error"] = f"{datetime.now().strftime('%Y-%m-%d %H:%M')} {exc}"
+        save_contacts(df)
         return df, emails_sent, False
 
     emails_sent += 1
+    df.at[idx, "last_error"] = ""
     cprint(
         f"  ✓ Email sent to {row['name']} ({row['email']}) — Step {step}",
         Fore.GREEN,
@@ -405,6 +437,7 @@ def add_contacts_interactive(df: pd.DataFrame) -> pd.DataFrame:
             "step": 1,
             "last_contact_date": "",
             "notes": "",
+            "created_date": datetime.now().strftime("%Y-%m-%d"),
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         save_contacts(df)
@@ -442,6 +475,7 @@ def import_contacts_csv(df: pd.DataFrame, path: str) -> pd.DataFrame:
             "step": 1,
             "last_contact_date": "",
             "notes": "",
+            "created_date": datetime.now().strftime("%Y-%m-%d"),
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         added += 1
@@ -484,7 +518,50 @@ def classify_due_contacts(df: pd.DataFrame) -> dict:
     return buckets
 
 
-def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
+def preview_email_step(df: pd.DataFrame, idx: int) -> None:
+    """Dry‑run: render and display an email without sending."""
+    row = df.loc[idx]
+    step = int(row["step"])
+    display_notes_log(row["notes"])
+    template_fn = TEMPLATE_MAP.get(step)
+    if not template_fn:
+        cprint(f"  No template for step {step}.", Fore.RED)
+        return
+    subject, body = template_fn(row["name"], row["company"], row["title"])
+    cprint(f"\n  To: {row['email']}", Fore.GREEN)
+    cprint(f"  Subject: {subject}", Fore.GREEN)
+    cprint(f"  {'─' * 40}", Fore.WHITE)
+    for line in body.splitlines():
+        cprint(f"  {line}", Fore.WHITE)
+    cprint(f"  {'─' * 40}", Fore.WHITE)
+    cprint(f"  [DRY RUN] Would send email.", Fore.YELLOW)
+
+
+def preview_manual_step(df: pd.DataFrame, idx: int) -> None:
+    """Dry‑run: display a manual task without prompting."""
+    row = df.loc[idx]
+    step = int(row["step"])
+    task = STEP_TYPE.get(step, "task").upper()
+    cprint(f"  {'─' * 60}", Fore.CYAN)
+    cprint(f"  MANUAL TASK: {task}", Fore.CYAN)
+    cprint(f"  Name    : {row['name']}", Fore.WHITE)
+    cprint(f"  Title   : {row['title']}", Fore.WHITE)
+    cprint(f"  Company : {row['company']}", Fore.WHITE)
+    cprint(f"  Phone   : {row['phone']}", Fore.WHITE)
+    cprint(f"  {'─' * 60}", Fore.CYAN)
+    display_notes_log(row["notes"])
+    script = get_manual_script(step, row["name"])
+    if script:
+        cprint(f"\n  {'═' * 56}", Fore.GREEN)
+        cprint(f"  SCRIPT:", Fore.GREEN)
+        cprint(f"  {'═' * 56}", Fore.GREEN)
+        for line in script.strip().splitlines():
+            cprint(f"  {line}", Fore.WHITE)
+        cprint(f"  {'═' * 56}", Fore.GREEN)
+    cprint(f"  [DRY RUN] Would prompt for manual action.", Fore.YELLOW)
+
+
+def review_and_run(df: pd.DataFrame, dry_run: bool = False) -> pd.DataFrame:
     """Main cadence loop: review → confirm → execute."""
     buckets = classify_due_contacts(df)
 
@@ -493,8 +570,9 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
     new_email_count = len(buckets["new_emails"])
     total = fu_email_count + fu_manual_count + new_email_count
 
-    cprint("\n╔══════════════════════════════════════╗", Fore.CYAN)
-    cprint("║       TODAY'S OUTREACH SUMMARY       ║", Fore.CYAN)
+    mode_label = "DRY RUN PREVIEW" if dry_run else "TODAY'S OUTREACH SUMMARY"
+    cprint(f"\n╔══════════════════════════════════════╗", Fore.CYAN)
+    cprint(f"║  {mode_label:^36}║", Fore.CYAN)
     cprint("╠══════════════════════════════════════╣", Fore.CYAN)
     cprint(f"║  Follow‑up Emails  : {fu_email_count:>4}            ║", Fore.WHITE)
     cprint(f"║  Manual Tasks      : {fu_manual_count:>4}            ║", Fore.WHITE)
@@ -507,6 +585,35 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
         cprint("\n  Nothing due today. Check back tomorrow!", Fore.GREEN)
         return df
 
+    # ── Dry‑run path ──
+    if dry_run:
+        cprint("\n── DRY RUN: Previewing all actions (nothing will be sent or saved) ──\n", Fore.YELLOW)
+        action_num = 0
+        if fu_email_count > 0:
+            cprint("── FOLLOW‑UP EMAILS ──", Fore.CYAN)
+        for idx in buckets["followup_emails"]:
+            action_num += 1
+            row = df.loc[idx]
+            cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
+            preview_email_step(df, idx)
+        if fu_manual_count > 0:
+            cprint("\n── MANUAL FOLLOW‑UP TASKS ──", Fore.CYAN)
+        for idx in buckets["followup_manual"]:
+            action_num += 1
+            row = df.loc[idx]
+            cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
+            preview_manual_step(df, idx)
+        if new_email_count > 0:
+            cprint("\n── NEW OUTREACH EMAILS ──", Fore.CYAN)
+        for idx in buckets["new_emails"]:
+            action_num += 1
+            row = df.loc[idx]
+            cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
+            preview_email_step(df, idx)
+        cprint(f"\n  Dry run complete. {total} actions previewed.", Fore.GREEN)
+        return df
+
+    # ── Live run ──
     confirm = input(
         f"\n{Fore.YELLOW}  Type 'GO' to execute, or anything else to cancel: {Style.RESET_ALL}"
     ).strip()
@@ -531,6 +638,7 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
             return df
 
     emails_sent = 0
+    action_num = 0
 
     # ── Phase 1: Follow‑up emails (highest priority) ──
     if fu_email_count > 0:
@@ -543,6 +651,9 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
                 Fore.RED,
             )
             break
+        action_num += 1
+        row = df.loc[idx]
+        cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
         df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
         if ok and emails_sent < DAILY_EMAIL_LIMIT:
             throttle()
@@ -551,6 +662,9 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
     if fu_manual_count > 0:
         cprint("\n── MANUAL FOLLOW‑UP TASKS ──", Fore.CYAN)
     for idx in buckets["followup_manual"]:
+        action_num += 1
+        row = df.loc[idx]
+        cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
         df = handle_manual_step(df, idx)
 
     # ── Phase 3: New outreach emails (lowest priority) ──
@@ -571,6 +685,9 @@ def review_and_run(df: pd.DataFrame) -> pd.DataFrame:
                     Fore.YELLOW,
                 )
                 break
+            action_num += 1
+            row = df.loc[idx]
+            cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
             df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
             if ok and emails_sent < DAILY_EMAIL_LIMIT:
                 throttle()
@@ -628,6 +745,360 @@ def show_status(df: pd.DataFrame) -> None:
             cprint(f"    Step {step} ({label}): {count}", Fore.WHITE)
 
     cprint(f"\n  Total contacts: {len(df)}", Fore.GREEN)
+
+
+# ──────────────────── WHO'S DUE TODAY ─────────────────────────
+
+def show_due_today(df: pd.DataFrame) -> None:
+    """Print a compact table of contacts whose next step is due."""
+    buckets = classify_due_contacts(df)
+    all_due = (
+        buckets["followup_emails"]
+        + buckets["followup_manual"]
+        + buckets["new_emails"]
+    )
+    if not all_due:
+        cprint("\n  Nothing due today!", Fore.GREEN)
+        return
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    cprint("\n── WHO'S DUE TODAY ──\n", Fore.CYAN)
+    cprint(f"  {'#':<3} {'Name':<20} {'Company':<20} {'Step':<6} {'Type':<10} {'Overdue'}", Fore.WHITE)
+    cprint(f"  {'─' * 75}", Fore.WHITE)
+
+    for i, idx in enumerate(all_due, 1):
+        row = df.loc[idx]
+        step = int(row["step"])
+        stype = STEP_TYPE.get(step, "?").upper()
+        last = row.get("last_contact_date", "")
+        if last:
+            try:
+                last_dt = datetime.strptime(str(last).strip(), "%Y-%m-%d")
+                due_date = next_business_day(last_dt + timedelta(days=STEP_WAIT_DAYS.get(step, 0)))
+                overdue = (today - due_date).days
+            except ValueError:
+                overdue = 0
+        else:
+            overdue = 0
+        overdue_str = f"+{overdue}d" if overdue > 0 else "today"
+        color = Fore.RED if overdue > 3 else (Fore.YELLOW if overdue > 0 else Fore.GREEN)
+        cprint(f"  {i:<3} {row['name']:<20} {row['company']:<20} {step:<6} {stype:<10} {overdue_str}", color)
+
+    cprint(f"\n  {len(all_due)} contacts due.", Fore.GREEN)
+
+
+# ──────────────────── CONTACT MANAGER ─────────────────────────
+
+def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
+    """Interactive contact manager with search/list/edit/delete/snooze."""
+    cprint("\n── CONTACT MANAGER ──\n", Fore.CYAN)
+    cprint("  Commands: search <term> | list [status|stepN] | edit <#> | delete <#> | snooze <#> | back", Fore.WHITE)
+
+    while True:
+        cmd = input(f"\n{Fore.YELLOW}  contacts> {Style.RESET_ALL}").strip()
+        if not cmd or cmd.lower() == "back":
+            break
+        parts = cmd.split(maxsplit=1)
+        action = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if action == "search":
+            _contact_search(df, arg)
+        elif action == "list":
+            _contact_list(df, arg)
+        elif action == "edit":
+            df = _contact_edit(df, arg)
+        elif action == "delete":
+            df = _contact_delete(df, arg)
+        elif action == "snooze":
+            df = _contact_snooze(df, arg)
+        else:
+            cprint("  Unknown command. Try: search, list, edit, delete, snooze, back", Fore.RED)
+    return df
+
+
+def _print_contact_table(filtered: pd.DataFrame) -> None:
+    """Print a compact table of contacts."""
+    if filtered.empty:
+        cprint("  No contacts match.", Fore.YELLOW)
+        return
+    cprint(f"\n  {'#':<4} {'Name':<20} {'Company':<18} {'Status':<15} {'Step':<5} {'Email'}", Fore.WHITE)
+    cprint(f"  {'─' * 80}", Fore.WHITE)
+    for idx, row in filtered.iterrows():
+        color = Fore.GREEN if row["status"] == "active" else Fore.WHITE
+        cprint(f"  {idx:<4} {row['name']:<20} {row['company']:<18} {row['status']:<15} {int(row['step']):<5} {row['email']}", color)
+
+
+def _contact_search(df: pd.DataFrame, term: str) -> None:
+    """Search contacts by name, company, or email."""
+    if not term:
+        cprint("  Usage: search <term>", Fore.RED)
+        return
+    mask = (
+        df["name"].str.contains(term, case=False, na=False)
+        | df["company"].str.contains(term, case=False, na=False)
+        | df["email"].str.contains(term, case=False, na=False)
+    )
+    _print_contact_table(df[mask])
+
+
+def _contact_list(df: pd.DataFrame, filter_arg: str) -> None:
+    """List contacts, optionally filtered by status or step."""
+    if not filter_arg:
+        _print_contact_table(df)
+        return
+    arg = filter_arg.strip().lower()
+    if arg in VALID_STATUSES:
+        _print_contact_table(df[df["status"] == arg])
+    elif arg.startswith("step") and arg[4:].isdigit():
+        _print_contact_table(df[df["step"] == int(arg[4:])])
+    else:
+        _print_contact_table(df[df["company"].str.contains(filter_arg, case=False, na=False)])
+
+
+def _contact_edit(df: pd.DataFrame, idx_str: str) -> pd.DataFrame:
+    """Edit a contact's fields."""
+    try:
+        idx = int(idx_str)
+    except (ValueError, TypeError):
+        cprint("  Usage: edit <row number>", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+
+    row = df.loc[idx]
+    cprint(f"\n  Editing: {row['name']} ({row['email']})", Fore.CYAN)
+    cprint("  Press Enter to keep current value.\n", Fore.WHITE)
+
+    editable = ["name", "email", "phone", "company", "title", "status"]
+    for field in editable:
+        current = str(row[field])
+        new_val = input(f"  {field} [{current}]: ").strip()
+        if new_val:
+            if field == "status" and new_val not in VALID_STATUSES:
+                cprint(f"  Invalid status. Valid: {VALID_STATUSES}", Fore.RED)
+                continue
+            if field == "status" and new_val == "replied" and row["status"] != "replied":
+                df.at[idx, "replied_date"] = datetime.now().strftime("%Y-%m-%d")
+            df.at[idx, field] = new_val
+
+    save_contacts(df)
+    cprint(f"  Contact updated.", Fore.GREEN)
+    return df
+
+
+def _contact_delete(df: pd.DataFrame, idx_str: str) -> pd.DataFrame:
+    """Delete a contact after confirmation."""
+    try:
+        idx = int(idx_str)
+    except (ValueError, TypeError):
+        cprint("  Usage: delete <row number>", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+
+    name = df.at[idx, "name"]
+    confirm = input(f"  Delete {name}? Type DELETE to confirm: ").strip()
+    if confirm == "DELETE":
+        df = df.drop(idx).reset_index(drop=True)
+        save_contacts(df)
+        cprint(f"  {name} deleted.", Fore.GREEN)
+    else:
+        cprint("  Cancelled.", Fore.YELLOW)
+    return df
+
+
+def _contact_snooze(df: pd.DataFrame, idx_str: str) -> pd.DataFrame:
+    """Snooze a contact until a specific date."""
+    try:
+        idx = int(idx_str)
+    except (ValueError, TypeError):
+        cprint("  Usage: snooze <row number>", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+
+    row = df.loc[idx]
+    current_snooze = row.get("snooze_until", "")
+    if current_snooze:
+        cprint(f"  Currently snoozed until: {current_snooze}", Fore.YELLOW)
+
+    date_str = input("  Snooze until (YYYY-MM-DD, or 'clear'): ").strip()
+    if date_str.lower() == "clear":
+        df.at[idx, "snooze_until"] = ""
+        save_contacts(df)
+        cprint(f"  Snooze cleared for {row['name']}.", Fore.GREEN)
+    else:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+            df.at[idx, "snooze_until"] = date_str
+            save_contacts(df)
+            cprint(f"  {row['name']} snoozed until {date_str}.", Fore.GREEN)
+        except ValueError:
+            cprint("  Invalid date format. Use YYYY-MM-DD.", Fore.RED)
+    return df
+
+
+# ──────────────────── RETRY FAILED EMAILS ─────────────────────
+
+def retry_failed(df: pd.DataFrame) -> pd.DataFrame:
+    """Re‑attempt all emails that previously failed."""
+    failed = df[df["last_error"].astype(str).str.strip() != ""]
+    if failed.empty:
+        cprint("\n  No failed emails to retry.", Fore.GREEN)
+        return df
+
+    cprint(f"\n── RETRY FAILED EMAILS ({len(failed)} contacts) ──\n", Fore.CYAN)
+    for idx, row in failed.iterrows():
+        cprint(f"  {row['name']} ({row['email']}) — Error: {row['last_error']}", Fore.RED)
+
+    confirm = input(f"\n{Fore.YELLOW}  Type 'GO' to retry all, or anything else to cancel: {Style.RESET_ALL}").strip()
+    if confirm != "GO":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+
+    email_addr, password = get_credentials()
+    if not email_addr or not password:
+        cprint("  Cannot send without credentials.", Fore.RED)
+        return df
+
+    try:
+        cprint("\n  Connecting to SMTP …", Fore.YELLOW)
+        smtp_server = connect_smtp()
+        cprint("  Connected.\n", Fore.GREEN)
+    except Exception as exc:
+        cprint(f"  SMTP connection failed: {exc}", Fore.RED)
+        return df
+
+    emails_sent = 0
+    for idx in failed.index:
+        df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
+        if ok:
+            throttle()
+
+    try:
+        smtp_server.quit()
+    except Exception:
+        pass
+
+    cprint(f"\n  Retry complete. {emails_sent} emails sent.", Fore.GREEN)
+    return df
+
+
+# ──────────────────── ANALYTICS & REPORTS ─────────────────────
+
+def show_funnel(df: pd.DataFrame) -> None:
+    """Display a horizontal bar chart of active contacts by step."""
+    active = df[df["status"] == "active"]
+    if active.empty:
+        cprint("  No active contacts.", Fore.YELLOW)
+        return
+
+    cprint("\n── CADENCE FUNNEL ──\n", Fore.CYAN)
+    max_bar = 30
+    max_count = active["step"].value_counts().max() if not active.empty else 1
+
+    for step in range(1, 7):
+        count = len(active[active["step"] == step])
+        bar_len = int((count / max_count) * max_bar) if max_count > 0 else 0
+        bar = "\u2588" * bar_len
+        stype = STEP_TYPE.get(step, "?").upper()
+        label = f"  Step {step} ({stype:<8})"
+        cprint(f"{label} {bar} {count}", Fore.GREEN if count > 0 else Fore.WHITE)
+
+    cprint(f"\n  ── Outcomes ──", Fore.CYAN)
+    for status in ["replied", "not_interested", "finished", "paused"]:
+        count = len(df[df["status"] == status])
+        if count > 0:
+            color = Fore.GREEN if status == "replied" else Fore.WHITE
+            cprint(f"  {status:<16} {count}", color)
+
+
+def show_activity_stats(df: pd.DataFrame) -> None:
+    """Parse notes timestamps to compute daily/weekly activity."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = today - timedelta(days=7)
+
+    today_actions = 0
+    week_actions = 0
+    step_counts = {s: 0 for s in range(1, 7)}
+
+    pattern = re.compile(r"\[(\d{4}-\d{2}-\d{2}) \d{2}:\d{2} S(\d)\]")
+    for _, row in df.iterrows():
+        notes = str(row.get("notes", ""))
+        for match in pattern.finditer(notes):
+            try:
+                dt = datetime.strptime(match.group(1), "%Y-%m-%d")
+                step_num = int(match.group(2))
+            except ValueError:
+                continue
+            if dt >= today:
+                today_actions += 1
+            if dt >= week_ago:
+                week_actions += 1
+                if step_num in step_counts:
+                    step_counts[step_num] += 1
+
+    cprint("\n── ACTIVITY STATS ──\n", Fore.CYAN)
+    cprint(f"  Actions today:     {today_actions}", Fore.WHITE)
+    cprint(f"  Actions this week: {week_actions}", Fore.WHITE)
+    cprint(f"\n  This week by step:", Fore.CYAN)
+    for step in range(1, 7):
+        stype = STEP_TYPE.get(step, "?").upper()
+        cprint(f"    Step {step} ({stype:<8}): {step_counts[step]}", Fore.WHITE)
+
+
+def show_conversion_rates(df: pd.DataFrame) -> None:
+    """Compute and display conversion metrics."""
+    total = len(df)
+    if total == 0:
+        cprint("  No contacts to analyze.", Fore.YELLOW)
+        return
+
+    replied = len(df[df["status"] == "replied"])
+    finished = len(df[df["status"] == "finished"])
+    not_int = len(df[df["status"] == "not_interested"])
+    active = len(df[df["status"] == "active"])
+    paused = len(df[df["status"] == "paused"])
+
+    cprint("\n── CONVERSION RATES ──\n", Fore.CYAN)
+    cprint(f"  Total contacts:    {total}", Fore.WHITE)
+    cprint(f"  Active:            {active} ({active / total * 100:.0f}%)", Fore.GREEN)
+    cprint(f"  Replied:           {replied} ({replied / total * 100:.0f}%)", Fore.GREEN)
+    cprint(f"  Finished cadence:  {finished} ({finished / total * 100:.0f}%)", Fore.WHITE)
+    cprint(f"  Not interested:    {not_int} ({not_int / total * 100:.0f}%)", Fore.WHITE)
+    cprint(f"  Paused:            {paused} ({paused / total * 100:.0f}%)", Fore.YELLOW)
+
+    replied_df = df[df["status"] == "replied"]
+    if not replied_df.empty:
+        avg_step = replied_df["step"].astype(int).mean()
+        cprint(f"\n  Avg step at reply: {avg_step:.1f}", Fore.CYAN)
+
+
+def analytics_menu(df: pd.DataFrame) -> None:
+    """Analytics submenu."""
+    while True:
+        cprint("\n── ANALYTICS & REPORTS ──", Fore.CYAN)
+        cprint("  1. Cadence funnel", Fore.WHITE)
+        cprint("  2. Activity stats (today/week)", Fore.WHITE)
+        cprint("  3. Conversion rates", Fore.WHITE)
+        cprint("  4. Back to main menu", Fore.WHITE)
+
+        choice = input(f"\n{Fore.YELLOW}  Select [1-4]: {Style.RESET_ALL}").strip()
+        if choice == "1":
+            show_funnel(df)
+        elif choice == "2":
+            show_activity_stats(df)
+        elif choice == "3":
+            show_conversion_rates(df)
+        elif choice == "4":
+            break
+        else:
+            cprint("  Invalid choice.", Fore.RED)
 
 
 # ──────────────────── DEMO MODE ───────────────────────────────
@@ -790,27 +1261,45 @@ def main_menu() -> None:
 
     while True:
         cprint("\n── MAIN MENU ──", Fore.CYAN)
-        cprint("  1. Run today's cadence", Fore.WHITE)
-        cprint("  2. Add contacts manually", Fore.WHITE)
-        cprint("  3. Import contacts from CSV", Fore.WHITE)
-        cprint("  4. View contact status", Fore.WHITE)
-        cprint("  5. Demo mode (test drive with fake data)", Fore.YELLOW)
-        cprint("  6. Exit", Fore.WHITE)
+        cprint("  1.  Run today's cadence", Fore.WHITE)
+        cprint("  2.  Dry-run (preview with real data)", Fore.WHITE)
+        cprint("  3.  Retry failed emails", Fore.WHITE)
+        cprint(f"  {'─' * 35}", Fore.WHITE)
+        cprint("  4.  Who's due today?", Fore.WHITE)
+        cprint("  5.  Search / Edit / Delete contacts", Fore.WHITE)
+        cprint("  6.  Add contacts manually", Fore.WHITE)
+        cprint("  7.  Import contacts from CSV", Fore.WHITE)
+        cprint(f"  {'─' * 35}", Fore.WHITE)
+        cprint("  8.  View contact status", Fore.WHITE)
+        cprint("  9.  Analytics & reports", Fore.WHITE)
+        cprint(f"  {'─' * 35}", Fore.WHITE)
+        cprint("  10. Demo mode (test drive with fake data)", Fore.YELLOW)
+        cprint("  0.  Exit", Fore.WHITE)
 
-        choice = input(f"\n{Fore.YELLOW}  Select [1-6]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.YELLOW}  Select [0-10]: {Style.RESET_ALL}").strip()
 
         if choice == "1":
             df = review_and_run(df)
         elif choice == "2":
-            df = add_contacts_interactive(df)
+            df = review_and_run(df, dry_run=True)
         elif choice == "3":
+            df = retry_failed(df)
+        elif choice == "4":
+            show_due_today(df)
+        elif choice == "5":
+            df = manage_contacts(df)
+        elif choice == "6":
+            df = add_contacts_interactive(df)
+        elif choice == "7":
             path = input("  Path to CSV file: ").strip()
             df = import_contacts_csv(df, path)
-        elif choice == "4":
+        elif choice == "8":
             show_status(df)
-        elif choice == "5":
+        elif choice == "9":
+            analytics_menu(df)
+        elif choice == "10":
             demo_mode()
-        elif choice == "6":
+        elif choice == "0":
             cprint("\n  Goodbye.\n", Fore.GREEN)
             break
         else:
