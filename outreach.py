@@ -7,6 +7,7 @@ Reads contacts from contacts.csv, prioritizes follow-ups over new leads,
 sends emails via Outlook/Office365 SMTP, and prompts for manual tasks.
 """
 
+import argparse
 import configparser
 import copy
 import csv
@@ -54,7 +55,7 @@ CSV_COLUMNS = [
     "name", "email", "phone", "company", "title",
     "status", "step", "last_contact_date", "notes",
     "snooze_until", "created_date", "replied_date", "last_error",
-    "meeting_date", "meeting_notes",
+    "meeting_date", "meeting_notes", "tags",
 ]
 
 VALID_STATUSES = {"active", "paused", "replied", "not_interested", "finished"}
@@ -836,6 +837,7 @@ def import_contacts_csv(df: pd.DataFrame, path: str) -> pd.DataFrame:
             "last_contact_date": "",
             "notes": "",
             "created_date": datetime.now().strftime("%Y-%m-%d"),
+            "tags": row.get("tags", ""),
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         added += 1
@@ -1151,9 +1153,15 @@ def show_due_today(df: pd.DataFrame) -> None:
 # ──────────────────── CONTACT MANAGER ─────────────────────────
 
 def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
-    """Interactive contact manager with search/list/edit/delete/snooze."""
+    """Interactive contact manager with search/list/edit/delete/snooze/bulk/tag."""
     cprint("\n── CONTACT MANAGER ──\n", Fore.CYAN)
-    cprint("  Commands: search <term> | list [status|stepN] | edit <#> | delete <#> | snooze <#> | back", Fore.WHITE)
+    cprint("  Commands:", Fore.WHITE)
+    cprint("    search <term>  |  list [status|stepN|tag:<name>]", Fore.WHITE)
+    cprint("    edit <#>  |  delete <#>  |  snooze <#>", Fore.WHITE)
+    cprint("    tag <#> <tag>  |  untag <#> <tag>", Fore.WHITE)
+    cprint("    bulk-status <status> <target>  |  bulk-snooze <date|clear> <target>", Fore.WHITE)
+    cprint("    bulk-delete <target>  |  back", Fore.WHITE)
+    cprint("  (target = all | stepN | status:<val> | idx,idx,...)", Fore.WHITE)
 
     while True:
         cmd = input(f"\n{Fore.YELLOW}  contacts> {Style.RESET_ALL}").strip()
@@ -1173,8 +1181,18 @@ def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
             df = _contact_delete(df, arg)
         elif action == "snooze":
             df = _contact_snooze(df, arg)
+        elif action == "tag":
+            df = _contact_tag(df, arg)
+        elif action == "untag":
+            df = _contact_untag(df, arg)
+        elif action == "bulk-status":
+            df = _bulk_status(df, arg)
+        elif action == "bulk-snooze":
+            df = _bulk_snooze(df, arg)
+        elif action == "bulk-delete":
+            df = _bulk_delete(df, arg)
         else:
-            cprint("  Unknown command. Try: search, list, edit, delete, snooze, back", Fore.RED)
+            cprint("  Unknown command. Type 'back' to exit.", Fore.RED)
     return df
 
 
@@ -1242,6 +1260,12 @@ def _contact_list(df: pd.DataFrame, filter_arg: str) -> None:
         _print_contact_table(df[df["status"] == arg])
     elif arg.startswith("step") and arg[4:].isdigit():
         _print_contact_table(df[df["step"] == int(arg[4:])])
+    elif arg.startswith("tag:"):
+        tag_val = re.escape(arg[4:].strip())
+        mask = df["tags"].str.contains(
+            rf"(?:^|\|){tag_val}(?:\||$)", case=False, na=False
+        )
+        _print_contact_table(df[mask])
     else:
         _print_contact_table(df[df["company"].str.contains(filter_arg, case=False, na=False)])
 
@@ -1329,6 +1353,187 @@ def _contact_snooze(df: pd.DataFrame, idx_str: str) -> pd.DataFrame:
             cprint(f"  {row['name']} snoozed until {date_str}.", Fore.GREEN)
         except ValueError:
             cprint("  Invalid date format. Use YYYY-MM-DD.", Fore.RED)
+    return df
+
+
+# ──────────────────── BULK OPERATIONS ─────────────────────────
+
+def _resolve_bulk_target(df: pd.DataFrame, target: str) -> list[int]:
+    """Parse a bulk target expression into a list of DataFrame index values.
+
+    Accepted forms:
+      all            – every row
+      stepN          – contacts at step N (e.g. step1)
+      status:<val>   – contacts with a given status
+      1,4,7          – explicit comma-separated index integers
+    """
+    t = target.strip().lower()
+    if t == "all":
+        return list(df.index)
+    if t.startswith("step") and t[4:].isdigit():
+        return list(df[df["step"] == int(t[4:])].index)
+    if t.startswith("status:"):
+        val = t[7:]
+        return list(df[df["status"] == val].index)
+    # Comma-separated integers
+    indices = []
+    for part in t.split(","):
+        part = part.strip()
+        if part.isdigit():
+            idx = int(part)
+            if idx in df.index:
+                indices.append(idx)
+            else:
+                cprint(f"  Warning: index {idx} not found — skipping.", Fore.YELLOW)
+        elif part:
+            cprint(f"  Warning: '{part}' is not a valid index — skipping.", Fore.YELLOW)
+    return indices
+
+
+def _bulk_status(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """bulk-status <new_status> <target>  — set status on many contacts at once."""
+    parts = arg.split(maxsplit=1)
+    if len(parts) != 2:
+        cprint("  Usage: bulk-status <status> <all|stepN|status:<val>|idx,idx>", Fore.RED)
+        return df
+    new_status, target = parts
+    if new_status not in VALID_STATUSES:
+        cprint(f"  Invalid status '{new_status}'. Valid: {', '.join(sorted(VALID_STATUSES))}", Fore.RED)
+        return df
+    indices = _resolve_bulk_target(df, target)
+    if not indices:
+        cprint("  No contacts matched that target.", Fore.YELLOW)
+        return df
+    cprint(f"\n  Will set {len(indices)} contact(s) to '{new_status}':", Fore.YELLOW)
+    for i in indices:
+        cprint(f"    [{i}] {df.at[i, 'name']} ({df.at[i, 'email']})", Fore.WHITE)
+    confirm = input(f"\n{Fore.YELLOW}  Type YES to confirm: {Style.RESET_ALL}").strip()
+    if confirm != "YES":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    for i in indices:
+        save_undo(df, i, f"bulk-status → {new_status}")
+        df.at[i, "status"] = new_status
+        if new_status == "replied":
+            df.at[i, "replied_date"] = today_str
+    save_contacts(df)
+    cprint(f"  Updated {len(indices)} contact(s).", Fore.GREEN)
+    return df
+
+
+def _bulk_snooze(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """bulk-snooze <YYYY-MM-DD|clear> <target>  — snooze many contacts at once."""
+    parts = arg.split(maxsplit=1)
+    if len(parts) != 2:
+        cprint("  Usage: bulk-snooze <YYYY-MM-DD|clear> <all|stepN|status:<val>|idx,idx>", Fore.RED)
+        return df
+    date_val, target = parts
+    if date_val.lower() != "clear":
+        try:
+            datetime.strptime(date_val, "%Y-%m-%d")
+        except ValueError:
+            cprint("  Invalid date. Use YYYY-MM-DD or 'clear'.", Fore.RED)
+            return df
+    indices = _resolve_bulk_target(df, target)
+    if not indices:
+        cprint("  No contacts matched that target.", Fore.YELLOW)
+        return df
+    action_label = f"snooze until {date_val}" if date_val.lower() != "clear" else "clear snooze"
+    cprint(f"\n  Will {action_label} for {len(indices)} contact(s):", Fore.YELLOW)
+    for i in indices:
+        cprint(f"    [{i}] {df.at[i, 'name']} ({df.at[i, 'email']})", Fore.WHITE)
+    confirm = input(f"\n{Fore.YELLOW}  Type YES to confirm: {Style.RESET_ALL}").strip()
+    if confirm != "YES":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+    snooze_value = "" if date_val.lower() == "clear" else date_val
+    for i in indices:
+        save_undo(df, i, f"bulk-snooze → {date_val}")
+        df.at[i, "snooze_until"] = snooze_value
+    save_contacts(df)
+    cprint(f"  {action_label.capitalize()} applied to {len(indices)} contact(s).", Fore.GREEN)
+    return df
+
+
+def _bulk_delete(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """bulk-delete <target>  — permanently delete many contacts at once."""
+    if not arg.strip():
+        cprint("  Usage: bulk-delete <all|stepN|status:<val>|idx,idx>", Fore.RED)
+        return df
+    indices = _resolve_bulk_target(df, arg)
+    if not indices:
+        cprint("  No contacts matched that target.", Fore.YELLOW)
+        return df
+    cprint(f"\n  Will permanently delete {len(indices)} contact(s):", Fore.YELLOW)
+    for i in indices:
+        cprint(f"    [{i}] {df.at[i, 'name']} ({df.at[i, 'email']})", Fore.WHITE)
+    cprint(f"\n{Fore.RED}  This cannot be undone.{Style.RESET_ALL}", Fore.RED)
+    confirm = input(f"{Fore.YELLOW}  Type DELETE ALL to confirm: {Style.RESET_ALL}").strip()
+    if confirm != "DELETE ALL":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+    df = df.drop(index=indices).reset_index(drop=True)
+    save_contacts(df)
+    cprint(f"  Deleted {len(indices)} contact(s).", Fore.GREEN)
+    return df
+
+
+# ──────────────────── CONTACT TAGGING ─────────────────────────
+
+def _contact_tag(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """tag <index> <tag_name>  — add a tag to a contact."""
+    parts = arg.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        cprint("  Usage: tag <index> <tag_name>", Fore.RED)
+        return df
+    idx_str, raw_tag = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        cprint("  Invalid index.", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+    tag = raw_tag.strip().lower().replace(" ", "_")
+    existing = str(df.at[idx, "tags"]).strip()
+    current_tags = [t for t in existing.split("|") if t] if existing else []
+    if tag in current_tags:
+        cprint(f"  Tag '{tag}' already set on {df.at[idx, 'name']}.", Fore.YELLOW)
+        return df
+    current_tags.append(tag)
+    df.at[idx, "tags"] = "|".join(current_tags)
+    save_contacts(df)
+    cprint(f"  Tagged {df.at[idx, 'name']} with '{tag}'.", Fore.GREEN)
+    return df
+
+
+def _contact_untag(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """untag <index> <tag_name>  — remove a tag from a contact."""
+    parts = arg.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        cprint("  Usage: untag <index> <tag_name>", Fore.RED)
+        return df
+    idx_str, raw_tag = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        cprint("  Invalid index.", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+    tag = raw_tag.strip().lower().replace(" ", "_")
+    existing = str(df.at[idx, "tags"]).strip()
+    current_tags = [t for t in existing.split("|") if t] if existing else []
+    if tag not in current_tags:
+        cprint(f"  Tag '{tag}' not found on {df.at[idx, 'name']}.", Fore.YELLOW)
+        return df
+    current_tags.remove(tag)
+    df.at[idx, "tags"] = "|".join(current_tags)
+    save_contacts(df)
+    cprint(f"  Removed tag '{tag}' from {df.at[idx, 'name']}.", Fore.GREEN)
     return df
 
 
@@ -1817,6 +2022,119 @@ def _demo_notes_prompt(contact: dict) -> None:
         cprint(f"  [DEMO] Would save: [{timestamp} S{contact['step']}] {note}", Fore.YELLOW)
 
 
+# ──────────────────── HEADLESS AUTO-RUN ───────────────────────
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for non-interactive modes."""
+    p = argparse.ArgumentParser(
+        description="SalesloftLocal — CLI Sales Cadence Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python outreach.py                 # interactive menu\n"
+            "  python outreach.py --dry-run       # preview without sending\n"
+            "  python outreach.py --auto          # headless run for cron\n"
+        ),
+    )
+    p.add_argument(
+        "--auto",
+        action="store_true",
+        help="Headless mode: send all due emails without prompts (for cron/scheduler)",
+    )
+    p.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Preview today's actions without sending or saving anything",
+    )
+    return p.parse_args()
+
+
+def auto_run(df: pd.DataFrame) -> None:
+    """Non-interactive cadence run for cron/scheduler use.
+
+    Sends all due email steps automatically within the daily limit.
+    Prints structured log lines suitable for >> auto.log redirection.
+    Manual steps (call/SMS/LinkedIn) are printed as reminders and skipped.
+    """
+    load_config()
+    ts = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
+
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print(
+            f"[{ts()}] ERROR: Credentials not set. "
+            "Export OUTREACH_EMAIL and OUTREACH_PASSWORD before running --auto."
+        )
+        sys.exit(1)
+
+    buckets = classify_due_contacts(df)
+    email_indices = buckets["followup_emails"] + buckets["new_emails"]
+    manual_indices = buckets["followup_manual"]
+
+    if not email_indices and not manual_indices:
+        print(f"[{ts()}] Nothing due today. Exiting.")
+        return
+
+    print(
+        f"[{ts()}] Starting auto-run: "
+        f"{len(email_indices)} email(s), {len(manual_indices)} manual reminder(s)."
+    )
+
+    try:
+        smtp = connect_smtp()
+        print(f"[{ts()}] SMTP connected.")
+    except Exception as exc:
+        print(f"[{ts()}] ERROR SMTP connection failed: {exc}")
+        sys.exit(1)
+
+    emails_sent = 0
+    for idx in email_indices:
+        if emails_sent >= DAILY_EMAIL_LIMIT:
+            print(f"[{ts()}] Daily limit ({DAILY_EMAIL_LIMIT}) reached. Stopping emails.")
+            break
+        row = df.loc[idx]
+        step = int(row["step"])
+        result = get_template_for_step(step, row["name"], row["company"], row["title"])
+        if result is None:
+            print(f"[{ts()}] SKIP  Step {step} has no template — {row['name']}")
+            continue
+        subject, body = result
+        try:
+            save_undo(df, idx, f"[AUTO] Email Step {step} to {row['name']}")
+            send_email(smtp, row["email"], subject, body)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            df.at[idx, "last_contact_date"] = today_str
+            df.at[idx, "last_error"] = ""
+            if step >= 6:
+                df.at[idx, "status"] = "finished"
+            else:
+                df.at[idx, "step"] = step + 1
+            save_contacts(df)
+            emails_sent += 1
+            print(f"[{ts()}] SENT  Step {step} → {row['name']} <{row['email']}>")
+            throttle()
+        except smtplib.SMTPException as exc:
+            df.at[idx, "last_error"] = str(exc)
+            save_contacts(df)
+            print(f"[{ts()}] ERROR {row['email']}: {exc}")
+
+    for idx in manual_indices:
+        row = df.loc[idx]
+        step = int(row["step"])
+        task = STEP_TYPE.get(step, "task").upper()
+        print(
+            f"[{ts()}] REMINDER  {task} Step {step} due for "
+            f"{row['name']} ({row['company']}) — {row['phone']}"
+        )
+
+    try:
+        smtp.quit()
+    except Exception:
+        pass
+
+    print(f"[{ts()}] Done. Emails sent this run: {emails_sent}.")
+
+
 # ──────────────────── MAIN MENU ───────────────────────────────
 
 def main_menu() -> None:
@@ -1893,4 +2211,12 @@ def main_menu() -> None:
 
 
 if __name__ == "__main__":
-    main_menu()
+    args = parse_args()
+    if args.auto:
+        auto_run(load_contacts())
+    elif args.dry_run:
+        colorama_init(autoreset=True)
+        load_config()
+        review_and_run(load_contacts(), dry_run=True)
+    else:
+        main_menu()
