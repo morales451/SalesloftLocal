@@ -7,6 +7,7 @@ Reads contacts from contacts.csv, prioritizes follow-ups over new leads,
 sends emails via Outlook/Office365 SMTP, and prompts for manual tasks.
 """
 
+import configparser
 import copy
 import csv
 import json
@@ -45,6 +46,8 @@ THROTTLE_MAX_SECONDS = 90
 
 CSV_PATH = Path(__file__).parent / "contacts.csv"
 UNDO_FILE = Path(__file__).parent / ".undo_history.json"
+CONFIG_FILE = Path(__file__).parent / "config.ini"
+TEMPLATES_FILE = Path(__file__).parent / "templates.json"
 MAX_UNDO_ENTRIES = 20
 
 CSV_COLUMNS = [
@@ -75,6 +78,86 @@ STEP_TYPE = {
     5: "linkedin",
     6: "email",
 }
+
+# ─────────────────────────── CONFIG LOADER ────────────────────
+
+def _write_default_config() -> None:
+    """Generate a skeleton config.ini with current defaults."""
+    CONFIG_FILE.write_text(
+        "[smtp]\n"
+        "# Office365 SMTP settings\n"
+        "server = smtp.office365.com\n"
+        "port = 587\n"
+        "# Your Outlook email address\n"
+        "email =\n"
+        "# Leave password blank — use OUTREACH_PASSWORD env var instead\n"
+        "\n"
+        "[limits]\n"
+        "# Max emails per day\n"
+        "daily_email_limit = 150\n"
+        "# Random throttle delay between emails (seconds)\n"
+        "throttle_min_seconds = 30\n"
+        "throttle_max_seconds = 90\n"
+        "\n"
+        "[cadence]\n"
+        "# Days to wait before each step becomes due\n"
+        "step1 = 0\n"
+        "step2 = 2\n"
+        "step3 = 3\n"
+        "step4 = 2\n"
+        "step5 = 2\n"
+        "step6 = 4\n"
+    )
+
+
+def load_config() -> None:
+    """Load settings from config.ini, overriding hardcoded defaults."""
+    global SMTP_SERVER, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD
+    global DAILY_EMAIL_LIMIT, THROTTLE_MIN_SECONDS, THROTTLE_MAX_SECONDS
+    global STEP_WAIT_DAYS
+
+    if not CONFIG_FILE.exists():
+        _write_default_config()
+        return
+
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE)
+
+    if "smtp" in cfg:
+        SMTP_SERVER = cfg["smtp"].get("server", SMTP_SERVER)
+        SMTP_PORT = cfg["smtp"].getint("port", SMTP_PORT)
+        # Env vars take priority over config file for credentials
+        if not SMTP_EMAIL:
+            SMTP_EMAIL = cfg["smtp"].get("email", "") or SMTP_EMAIL
+        if not SMTP_PASSWORD:
+            SMTP_PASSWORD = cfg["smtp"].get("password", "") or SMTP_PASSWORD
+
+    if "limits" in cfg:
+        DAILY_EMAIL_LIMIT = cfg["limits"].getint("daily_email_limit", DAILY_EMAIL_LIMIT)
+        THROTTLE_MIN_SECONDS = cfg["limits"].getint("throttle_min_seconds", THROTTLE_MIN_SECONDS)
+        THROTTLE_MAX_SECONDS = cfg["limits"].getint("throttle_max_seconds", THROTTLE_MAX_SECONDS)
+
+    if "cadence" in cfg:
+        for key, val in cfg["cadence"].items():
+            if key.startswith("step") and key[4:].isdigit():
+                STEP_WAIT_DAYS[int(key[4:])] = int(val)
+
+
+def show_settings() -> None:
+    """Display current active settings."""
+    cprint("\n── CURRENT SETTINGS ──\n", Fore.CYAN)
+    cprint(f"  Config file  : {CONFIG_FILE}", Fore.WHITE)
+    cprint(f"  SMTP server  : {SMTP_SERVER}:{SMTP_PORT}", Fore.WHITE)
+    cprint(f"  Email        : {SMTP_EMAIL or '(not set)'}", Fore.WHITE)
+    cprint(f"  Password     : {'(set)' if SMTP_PASSWORD else '(not set)'}", Fore.WHITE)
+    cprint(f"  Daily limit  : {DAILY_EMAIL_LIMIT} emails", Fore.WHITE)
+    cprint(f"  Throttle     : {THROTTLE_MIN_SECONDS}–{THROTTLE_MAX_SECONDS}s", Fore.WHITE)
+    cprint(f"\n  Step wait days:", Fore.CYAN)
+    for step, days in sorted(STEP_WAIT_DAYS.items()):
+        stype = STEP_TYPE.get(step, "?").upper()
+        cprint(f"    Step {step} ({stype:<8}): {days} days", Fore.WHITE)
+    cprint(f"\n  Edit {CONFIG_FILE.name} to change these settings.", Fore.YELLOW)
+
 
 # ─────────────────────────── EMAIL TEMPLATES ──────────────────
 
@@ -134,6 +217,151 @@ TEMPLATE_MAP = {
     3: template_b,
     6: template_c,
 }
+
+# ──────────────────── JSON TEMPLATE SYSTEM ────────────────────
+
+def _default_templates() -> dict:
+    """Return hardcoded templates as a JSON-serializable dict (uses <<token>> syntax)."""
+    return {
+        "1": {
+            "subject": "Henry Roof Coatings vs. Current Supplier",
+            "body": (
+                "<<name>>,\n\n"
+                "I'm Alex with Carlisle, the commercial roofing manufacturer.\n\n"
+                "Do you offer roof coatings for customers who can't afford full commercial roof replacement?\n\n"
+                "If you already do, I'd love to compare Henry Roof Coatings with your current supplier"
+                "\u2014just to keep them honest.\n\n"
+                "Coatings can help you close more deals and drive more revenue with a budget-friendly option.\n\n"
+                "Can I stop by your office next week?\n\nThanks,"
+            ),
+        },
+        "3": {
+            "subject": "Re: Henry Roof Coatings vs. Current Supplier",
+            "body": (
+                "<<name>>,\n\n"
+                "Circling back on the note below.\n\n"
+                "Are you currently walking away from leads that can't get budget approval for a full tear-off?\n\n"
+                "Henry Roof Coatings can turn those lost bids into profitable projects with much lower labor costs.\n\n"
+                "I'll be in your area next Tuesday\u2014do you have 5 minutes for me to drop off some info?\n\nThanks,"
+            ),
+        },
+        "6": {
+            "subject": "Re: Henry Roof Coatings vs. Current Supplier",
+            "body": (
+                "<<name>>,\n\n"
+                "I haven't heard back, so I'll assume you're all set with your current coating strategy for now.\n\n"
+                "I won't keep following up, but keep us in mind next time you need a competitive number "
+                "to keep your current supplier honest.\n\n"
+                "Feel free to reach out if you have a specific project you need a spec for.\n\nBest,"
+            ),
+        },
+    }
+
+
+def load_templates() -> dict:
+    """Load templates from templates.json, falling back to defaults if missing/corrupt."""
+    if TEMPLATES_FILE.exists():
+        try:
+            return json.loads(TEMPLATES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    templates = _default_templates()
+    TEMPLATES_FILE.write_text(json.dumps(templates, indent=2))
+    return templates
+
+
+def render_template(tmpl: dict, name: str, company: str, title: str) -> tuple[str, str]:
+    """Substitute <<name>>, <<company>>, <<title>> tokens in a template dict."""
+    def sub(text: str) -> str:
+        return (
+            text.replace("<<name>>", name)
+                .replace("<<company>>", company)
+                .replace("<<title>>", title)
+        )
+    return sub(tmpl["subject"]), sub(tmpl["body"])
+
+
+def get_template_for_step(
+    step: int, name: str, company: str, title: str
+) -> tuple[str, str] | None:
+    """Return (subject, body) for a step. Prefers JSON templates, falls back to hardcoded."""
+    templates = load_templates()
+    tmpl = templates.get(str(step))
+    if tmpl:
+        return render_template(tmpl, name, company, title)
+    fn = TEMPLATE_MAP.get(step)
+    if fn:
+        return fn(name, company, title)
+    return None
+
+
+def edit_templates() -> None:
+    """Interactive editor for email templates stored in templates.json."""
+    step_labels = {
+        "1": "Step 1 \u2014 Initial outreach (email)",
+        "3": "Step 3 \u2014 Follow-up (email)",
+        "6": "Step 6 \u2014 Break-up (email)",
+    }
+
+    while True:
+        templates = load_templates()
+        cprint("\n\u2500\u2500 EMAIL TEMPLATE EDITOR \u2500\u2500\n", Fore.CYAN)
+        for key, label in step_labels.items():
+            tmpl = templates.get(key, {})
+            subject_preview = tmpl.get("subject", "(none)")[:55]
+            cprint(f"  [{key}] {label}", Fore.WHITE)
+            cprint(f"      Subject: {subject_preview}", Fore.WHITE)
+        cprint("\n  [r] Reset all to defaults", Fore.YELLOW)
+        cprint("  [b] Back", Fore.WHITE)
+
+        choice = input(
+            f"\n{Fore.YELLOW}  Select step to edit [1/3/6/r/b]: {Style.RESET_ALL}"
+        ).strip().lower()
+
+        if choice == "b":
+            break
+        elif choice == "r":
+            confirm = input("  Type RESET to confirm reset to defaults: ").strip()
+            if confirm == "RESET":
+                defaults = _default_templates()
+                TEMPLATES_FILE.write_text(json.dumps(defaults, indent=2))
+                cprint("  Templates reset to defaults.", Fore.GREEN)
+        elif choice in step_labels:
+            tmpl = templates.get(choice, {})
+            cprint(f"\n  Editing: {step_labels[choice]}", Fore.CYAN)
+            cprint("  Tokens: <<name>>  <<company>>  <<title>>\n", Fore.WHITE)
+
+            current_subject = tmpl.get("subject", "")
+            new_subject = input(f"  Subject [{current_subject}]: ").strip()
+            if new_subject:
+                tmpl["subject"] = new_subject
+
+            cprint(f"\n  Current body:", Fore.WHITE)
+            for line in tmpl.get("body", "").splitlines():
+                cprint(f"    {line}", Fore.WHITE)
+            cprint(
+                "\n  Enter new body line by line. Empty line to finish.",
+                Fore.YELLOW,
+            )
+            cprint("  Press Enter immediately to keep current body.", Fore.YELLOW)
+
+            body_lines: list[str] = []
+            first = input("  > ").rstrip("\n")
+            if first:
+                body_lines.append(first)
+                while True:
+                    ln = input("  > ").rstrip("\n")
+                    if not ln:
+                        break
+                    body_lines.append(ln)
+                tmpl["body"] = "\n".join(body_lines)
+
+            templates[choice] = tmpl
+            TEMPLATES_FILE.write_text(json.dumps(templates, indent=2))
+            cprint("  Template saved.", Fore.GREEN)
+        else:
+            cprint("  Invalid choice.", Fore.RED)
+
 
 # ──────────────────── MANUAL TASK SCRIPTS ─────────────────────
 
@@ -306,8 +534,20 @@ def save_undo(df: pd.DataFrame, idx: int, description: str) -> None:
     UNDO_FILE.write_text(json.dumps(history, indent=2))
 
 
+def _show_undo_history(history: list) -> None:
+    """Print available undo steps, most recent first."""
+    cprint(f"\n── UNDO HISTORY ({len(history)} step{'s' if len(history) != 1 else ''} available) ──\n", Fore.CYAN)
+    for i, entry in enumerate(reversed(history), 1):
+        snap = entry["snapshot"]
+        cprint(
+            f"  [{i}] {entry['timestamp']}  {entry['description']}"
+            f"  ({snap.get('name', '?')})",
+            Fore.WHITE,
+        )
+
+
 def undo_last_action(df: pd.DataFrame) -> pd.DataFrame:
-    """Restore the last modified contact to its previous state."""
+    """Restore modified contacts to previous states, one step at a time."""
     if not UNDO_FILE.exists():
         cprint("\n  Nothing to undo.", Fore.YELLOW)
         return df
@@ -322,38 +562,54 @@ def undo_last_action(df: pd.DataFrame) -> pd.DataFrame:
         cprint("\n  Nothing to undo.", Fore.YELLOW)
         return df
 
-    entry = history[-1]
-    snap = entry["snapshot"]
+    while history:
+        _show_undo_history(history)
+        entry = history[-1]
+        snap = entry["snapshot"]
 
-    cprint(f"\n── UNDO LAST ACTION ──\n", Fore.CYAN)
-    cprint(f"  Action : {entry['description']}", Fore.WHITE)
-    cprint(f"  Time   : {entry['timestamp']}", Fore.WHITE)
-    cprint(f"  Contact: {snap.get('name', '?')} ({snap.get('email', '?')})", Fore.WHITE)
-    cprint(f"  Will restore to: Step {snap.get('step', '?')}, Status: {snap.get('status', '?')}", Fore.WHITE)
+        cprint(f"\n── NEXT UNDO ──", Fore.CYAN)
+        cprint(f"  Action : {entry['description']}", Fore.WHITE)
+        cprint(f"  Time   : {entry['timestamp']}", Fore.WHITE)
+        cprint(f"  Contact: {snap.get('name', '?')} ({snap.get('email', '?')})", Fore.WHITE)
+        cprint(
+            f"  Restores to: Step {snap.get('step', '?')}, Status: {snap.get('status', '?')}",
+            Fore.WHITE,
+        )
 
-    confirm = input(f"\n{Fore.YELLOW}  Type UNDO to confirm, or anything else to cancel: {Style.RESET_ALL}").strip()
-    if confirm != "UNDO":
-        cprint("  Cancelled.", Fore.YELLOW)
-        return df
+        confirm = input(
+            f"\n{Fore.YELLOW}  Type UNDO to restore, or anything else to stop: {Style.RESET_ALL}"
+        ).strip()
+        if confirm != "UNDO":
+            cprint("  Stopped.", Fore.YELLOW)
+            break
 
-    idx = entry["idx"]
-    # Find the contact by email (idx may have shifted after deletes)
-    email = snap.get("email", "")
-    matches = df[df["email"].str.strip().str.lower() == email.strip().lower()]
-    if matches.empty:
-        cprint(f"  Contact {email} not found in CSV. May have been deleted.", Fore.RED)
-        return df
+        # Find contact by email (index may have shifted after deletes)
+        email = snap.get("email", "")
+        matches = df[df["email"].str.strip().str.lower() == email.strip().lower()]
+        if matches.empty:
+            cprint(f"  Contact {email} not found in CSV. May have been deleted.", Fore.RED)
+            history.pop()
+            UNDO_FILE.write_text(json.dumps(history, indent=2))
+            break
 
-    actual_idx = matches.index[0]
-    for col, val in snap.items():
-        if col in df.columns:
-            df.at[actual_idx, col] = val
-    df["step"] = pd.to_numeric(df["step"], errors="coerce").fillna(0).astype(int)
+        actual_idx = matches.index[0]
+        for col, val in snap.items():
+            if col in df.columns:
+                df.at[actual_idx, col] = val
+        df["step"] = pd.to_numeric(df["step"], errors="coerce").fillna(0).astype(int)
 
-    save_contacts(df)
-    history.pop()
-    UNDO_FILE.write_text(json.dumps(history, indent=2))
-    cprint(f"  Restored {snap['name']} to Step {snap['step']}, Status: {snap['status']}.", Fore.GREEN)
+        save_contacts(df)
+        history.pop()
+        UNDO_FILE.write_text(json.dumps(history, indent=2))
+        cprint(
+            f"  Restored {snap['name']} to Step {snap['step']}, Status: {snap['status']}.",
+            Fore.GREEN,
+        )
+
+        if not history:
+            cprint("\n  No more undo steps available.", Fore.YELLOW)
+            break
+
     return df
 
 
@@ -387,12 +643,12 @@ def handle_email_step(
     row = df.loc[idx]
     step = int(row["step"])
     display_notes_log(row["notes"])
-    template_fn = TEMPLATE_MAP.get(step)
-    if template_fn is None:
+    result = get_template_for_step(step, row["name"], row["company"], row["title"])
+    if result is None:
         cprint(f"  No email template for step {step}; skipping.", Fore.RED)
         return df, emails_sent, False
 
-    subject, body = template_fn(row["name"], row["company"], row["title"])
+    subject, body = result
 
     # Preview email before sending
     cprint(f"\n  To: {row['email']}", Fore.GREEN)
@@ -627,11 +883,11 @@ def preview_email_step(df: pd.DataFrame, idx: int) -> None:
     row = df.loc[idx]
     step = int(row["step"])
     display_notes_log(row["notes"])
-    template_fn = TEMPLATE_MAP.get(step)
-    if not template_fn:
+    result = get_template_for_step(step, row["name"], row["company"], row["title"])
+    if result is None:
         cprint(f"  No template for step {step}.", Fore.RED)
         return
-    subject, body = template_fn(row["name"], row["company"], row["title"])
+    subject, body = result
     cprint(f"\n  To: {row['email']}", Fore.GREEN)
     cprint(f"  Subject: {subject}", Fore.GREEN)
     cprint(f"  {'─' * 40}", Fore.WHITE)
@@ -922,16 +1178,45 @@ def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _print_contact_table(filtered: pd.DataFrame) -> None:
-    """Print a compact table of contacts."""
+def _print_contact_table(filtered: pd.DataFrame, page_size: int = 20) -> None:
+    """Print a paginated table of contacts."""
     if filtered.empty:
         cprint("  No contacts match.", Fore.YELLOW)
         return
-    cprint(f"\n  {'#':<4} {'Name':<20} {'Company':<18} {'Status':<15} {'Step':<5} {'Email'}", Fore.WHITE)
-    cprint(f"  {'─' * 80}", Fore.WHITE)
-    for idx, row in filtered.iterrows():
-        color = Fore.GREEN if row["status"] == "active" else Fore.WHITE
-        cprint(f"  {idx:<4} {row['name']:<20} {row['company']:<18} {row['status']:<15} {int(row['step']):<5} {row['email']}", color)
+
+    total = len(filtered)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = 0
+
+    while True:
+        start = page * page_size
+        chunk = filtered.iloc[start:start + page_size]
+
+        cprint(f"\n  {'#':<4} {'Name':<20} {'Company':<18} {'Status':<15} {'Step':<5} {'Email'}", Fore.WHITE)
+        cprint(f"  {'─' * 80}", Fore.WHITE)
+        for idx, row in chunk.iterrows():
+            color = Fore.GREEN if row["status"] == "active" else Fore.WHITE
+            cprint(
+                f"  {idx:<4} {row['name']:<20} {row['company']:<18} "
+                f"{row['status']:<15} {int(row['step']):<5} {row['email']}",
+                color,
+            )
+
+        if total_pages > 1:
+            cprint(
+                f"\n  Page {page + 1}/{total_pages} — {total} contacts total",
+                Fore.CYAN,
+            )
+            nav = input("  [n]ext / [p]rev / [q]uit: ").strip().lower()
+            if nav == "n" and page < total_pages - 1:
+                page += 1
+            elif nav == "p" and page > 0:
+                page -= 1
+            else:
+                break
+        else:
+            cprint(f"\n  {total} contact{'s' if total != 1 else ''}", Fore.CYAN)
+            break
 
 
 def _contact_search(df: pd.DataFrame, term: str) -> None:
@@ -1448,9 +1733,9 @@ def demo_mode() -> None:
         step = c["step"]
         cprint(f"\n  [{action_num}/{len(ordered)}] {c['name']} — {c['company']} (Step {step})", Fore.CYAN)
         display_notes_log(c["notes"])
-        template_fn = TEMPLATE_MAP.get(step)
-        if template_fn:
-            subject, body = template_fn(c["name"], c["company"], c["title"])
+        demo_tmpl = get_template_for_step(step, c["name"], c["company"], c["title"])
+        if demo_tmpl:
+            subject, body = demo_tmpl
             cprint(f"\n  Subject: {subject}", Fore.GREEN)
             cprint(f"  To: {c['email']}", Fore.GREEN)
             cprint(f"  {'─' * 40}", Fore.WHITE)
@@ -1499,9 +1784,9 @@ def demo_mode() -> None:
         step = c["step"]
         cprint(f"\n  [{action_num}/{len(ordered)}] {c['name']} — {c['company']} (Step {step})", Fore.CYAN)
         display_notes_log(c["notes"])
-        template_fn = TEMPLATE_MAP.get(step)
-        if template_fn:
-            subject, body = template_fn(c["name"], c["company"], c["title"])
+        demo_tmpl = get_template_for_step(step, c["name"], c["company"], c["title"])
+        if demo_tmpl:
+            subject, body = demo_tmpl
             cprint(f"\n  Subject: {subject}", Fore.GREEN)
             cprint(f"  To: {c['email']}", Fore.GREEN)
             cprint(f"  {'─' * 40}", Fore.WHITE)
@@ -1537,6 +1822,7 @@ def _demo_notes_prompt(contact: dict) -> None:
 def main_menu() -> None:
     """Interactive main menu."""
     colorama_init(autoreset=True)
+    load_config()
 
     cprint("\n╔══════════════════════════════════════════╗", Fore.CYAN)
     cprint("║   SALESLOFT LOCAL — CLI Outreach Tool    ║", Fore.CYAN)
@@ -1559,12 +1845,14 @@ def main_menu() -> None:
         cprint("  9.  Analytics & reports", Fore.WHITE)
         cprint("  10. Daily recap", Fore.WHITE)
         cprint("  11. Export contacts to CSV", Fore.WHITE)
-        cprint("  12. Undo last action", Fore.YELLOW)
+        cprint("  12. Undo (up to 20 steps)", Fore.YELLOW)
         cprint(f"  {'─' * 35}", Fore.WHITE)
         cprint("  13. Demo mode (test drive with fake data)", Fore.YELLOW)
+        cprint("  14. Edit email templates", Fore.WHITE)
+        cprint("  15. Settings", Fore.WHITE)
         cprint("  0.  Exit", Fore.WHITE)
 
-        choice = input(f"\n{Fore.YELLOW}  Select [0-13]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.YELLOW}  Select [0-15]: {Style.RESET_ALL}").strip()
 
         if choice == "1":
             df = review_and_run(df)
@@ -1593,6 +1881,10 @@ def main_menu() -> None:
             df = undo_last_action(df)
         elif choice == "13":
             demo_mode()
+        elif choice == "14":
+            edit_templates()
+        elif choice == "15":
+            show_settings()
         elif choice == "0":
             cprint("\n  Goodbye.\n", Fore.GREEN)
             break
