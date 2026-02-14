@@ -1,11 +1,11 @@
-name,email,phone,company,title,status,step,last_contact_date,notes
-Jane Smith,jane.smith@acmecorp.com,555-0101,Acme Corp,VP of Sales,active,1,,
-Tom Richards,tom.r@globex.io,555-0102,Globex Inc,Director of Ops,active,3,2026-02-01,Opened first email
-Maria Garcia,maria.garcia@initech.com,555-0103,Initech,Head of Marketing,active,6,2026-01-30,Engaged on LinkedIn
-Kevin Park,kevin.park@waynetech.com,555-0104,Wayne Technologies,CTO,active,2,2026-02-03,Sent intro email
-Lisa Chen,lisa.chen@umbrella.co,555-0105,Umbrella Corp,VP of Engineering,active,1,,
-Omar Patel,omar@piedpiper.io,555-0106,Pied Piper,CEO,paused,2,2026-01-28,Missing phone number
-Sarah Kim,sarah.kim@hooli.com,555-0107,Hooli,Sales Manager,replied,3,2026-02-02,Replied interested
-David Brown,david.b@soylent.com,555-0108,Soylent Corp,COO,active,4,2026-02-02,Called — no answer
-Rachel Adams,rachel@massivedata.io,555-0109,Massive Dynamic,Head of BD,active,5,2026-02-01,SMS sent
-James Wilson,james.w@stark.com,555-0110,Stark Industries,VP of Partnerships,not_interested,2,2026-01-25,Asked to be removed
+name,email,phone,company,title,status,step,last_contact_date,notes,snooze_until,created_date,replied_date,last_error,meeting_date,meeting_notes,tags
+Jane Smith,jane.smith@acmecorp.com,555-0101,Acme Corp,VP of Sales,active,1,,,,,,,,,
+Tom Richards,tom.r@globex.io,555-0102,Globex Inc,Director of Ops,active,3,2026-02-01,Opened first email,,,,,,,
+Maria Garcia,maria.garcia@initech.com,555-0103,Initech,Head of Marketing,active,6,2026-01-30,Engaged on LinkedIn,,,,,,,
+Kevin Park,kevin.park@waynetech.com,555-0104,Wayne Technologies,CTO,active,2,2026-02-03,Sent intro email,,,,,,,
+Lisa Chen,lisa.chen@umbrella.co,555-0105,Umbrella Corp,VP of Engineering,active,1,,,,,,,,,
+Omar Patel,omar@piedpiper.io,555-0106,Pied Piper,CEO,paused,2,2026-01-28,Missing phone number,,,,,,,
+Sarah Kim,sarah.kim@hooli.com,555-0107,Hooli,Sales Manager,replied,3,2026-02-02,Replied interested,,,,,,,
+David Brown,david.b@soylent.com,555-0108,Soylent Corp,COO,active,4,2026-02-02,Called — no answer,,,,,,,
+Rachel Adams,rachel@massivedata.io,555-0109,Massive Dynamic,Head of BD,active,5,2026-02-01,SMS sent,,,,,,,
+James Wilson,james.w@stark.com,555-0110,Stark Industries,VP of Partnerships,not_interested,2,2026-01-25,Asked to be removed,,,,,,,
