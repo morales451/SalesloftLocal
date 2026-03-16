@@ -1203,10 +1203,10 @@ def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
     cprint("\n── CONTACT MANAGER ──\n", Fore.CYAN)
     cprint("  Commands:", Fore.WHITE)
     cprint("    search <term>  |  list [status|stepN|tag:<name>]", Fore.WHITE)
-    cprint("    edit <#>  |  delete <#>  |  snooze <#>", Fore.WHITE)
+    cprint("    edit <#>  |  delete <#>  |  snooze <#>  |  reset <#>", Fore.WHITE)
     cprint("    tag <#> <tag>  |  untag <#> <tag>", Fore.WHITE)
     cprint("    bulk-status <status> <target>  |  bulk-snooze <date|clear> <target>", Fore.WHITE)
-    cprint("    bulk-delete <target>  |  back", Fore.WHITE)
+    cprint("    bulk-reset <target>  |  bulk-delete <target>  |  back", Fore.WHITE)
     cprint("  (target = all | stepN | status:<val> | idx,idx,...)", Fore.WHITE)
 
     while True:
@@ -1235,6 +1235,10 @@ def manage_contacts(df: pd.DataFrame) -> pd.DataFrame:
             df = _bulk_status(df, arg)
         elif action == "bulk-snooze":
             df = _bulk_snooze(df, arg)
+        elif action == "reset":
+            df = _contact_reset(df, arg)
+        elif action == "bulk-reset":
+            df = _bulk_reset(df, arg)
         elif action == "bulk-delete":
             df = _bulk_delete(df, arg)
         else:
@@ -1522,6 +1526,77 @@ def _bulk_delete(df: pd.DataFrame, arg: str) -> pd.DataFrame:
     df = df.drop(index=indices).reset_index(drop=True)
     save_contacts(df)
     cprint(f"  Deleted {len(indices)} contact(s).", Fore.GREEN)
+    return df
+
+
+# ──────────────────── RESET PROGRESS ─────────────────────────
+
+def _reset_contact(df: pd.DataFrame, idx: int) -> None:
+    """Reset a single contact back to Step 1 with no history."""
+    df.at[idx, "step"] = 1
+    df.at[idx, "status"] = "active"
+    df.at[idx, "last_contact_date"] = ""
+    df.at[idx, "notes"] = ""
+    df.at[idx, "snooze_until"] = ""
+    df.at[idx, "replied_date"] = ""
+    df.at[idx, "last_error"] = ""
+    df.at[idx, "meeting_date"] = ""
+    df.at[idx, "meeting_notes"] = ""
+
+
+def _contact_reset(df: pd.DataFrame, idx_str: str) -> pd.DataFrame:
+    """reset <#>  — reset a single contact back to Step 1."""
+    try:
+        idx = int(idx_str)
+    except (ValueError, TypeError):
+        cprint("  Usage: reset <row number>", Fore.RED)
+        return df
+    if idx not in df.index:
+        cprint(f"  No contact at index {idx}.", Fore.RED)
+        return df
+
+    row = df.loc[idx]
+    cprint(f"\n  Will reset: {row['name']} ({row['email']})", Fore.YELLOW)
+    cprint(f"  Current: Step {int(row['step'])}, Status: {row['status']}", Fore.WHITE)
+    cprint(f"  This clears all progress, notes, dates, and errors.", Fore.YELLOW)
+
+    confirm = input(f"\n{Fore.YELLOW}  Type RESET to confirm: {Style.RESET_ALL}").strip()
+    if confirm != "RESET":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+
+    save_undo(df, idx, f"reset {row['name']}")
+    _reset_contact(df, idx)
+    save_contacts(df)
+    cprint(f"  {row['name']} reset to Step 1, active.", Fore.GREEN)
+    return df
+
+
+def _bulk_reset(df: pd.DataFrame, arg: str) -> pd.DataFrame:
+    """bulk-reset <target>  — reset many contacts back to Step 1."""
+    if not arg.strip():
+        cprint("  Usage: bulk-reset <all|stepN|status:<val>|idx,idx>", Fore.RED)
+        return df
+    indices = _resolve_bulk_target(df, arg)
+    if not indices:
+        cprint("  No contacts matched that target.", Fore.YELLOW)
+        return df
+
+    cprint(f"\n  Will reset {len(indices)} contact(s) to Step 1:", Fore.YELLOW)
+    for i in indices:
+        cprint(f"    [{i}] {df.at[i, 'name']} ({df.at[i, 'email']}) — Step {int(df.at[i, 'step'])}, {df.at[i, 'status']}", Fore.WHITE)
+    cprint(f"\n  This clears all progress, notes, dates, and errors.", Fore.YELLOW)
+
+    confirm = input(f"\n{Fore.YELLOW}  Type RESET ALL to confirm: {Style.RESET_ALL}").strip()
+    if confirm != "RESET ALL":
+        cprint("  Cancelled.", Fore.YELLOW)
+        return df
+
+    for i in indices:
+        save_undo(df, i, f"bulk-reset")
+        _reset_contact(df, i)
+    save_contacts(df)
+    cprint(f"  Reset {len(indices)} contact(s) to Step 1.", Fore.GREEN)
     return df
 
 
