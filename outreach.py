@@ -4,7 +4,7 @@ outreach.py — CLI Sales Cadence Manager
 
 Manages a 6-touchpoint sales cadence from the command line.
 Reads contacts from contacts.csv, prioritizes follow-ups over new leads,
-displays emails for manual sending via Outlook, and prompts for manual tasks.
+sends emails via Outlook/Office365 SMTP, and prompts for manual tasks.
 """
 
 import argparse
@@ -13,9 +13,15 @@ import copy
 import csv
 import json
 import os
+import random
 import re
+import smtplib
 import sys
+import time
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from getpass import getpass
 from pathlib import Path
 
 try:
@@ -30,6 +36,17 @@ except ImportError:
 
 # ─────────────────────────── CONFIG ───────────────────────────
 
+# Send mode: "manual" = display emails for copy/paste, "auto" = send via SMTP
+SEND_MODE = os.environ.get("OUTREACH_SEND_MODE", "manual")
+
+SMTP_SERVER = "smtp.office365.com"
+SMTP_PORT = 587
+SMTP_EMAIL = os.environ.get("OUTREACH_EMAIL", "")
+SMTP_PASSWORD = os.environ.get("OUTREACH_PASSWORD", "")
+
+DAILY_EMAIL_LIMIT = 150
+THROTTLE_MIN_SECONDS = 30
+THROTTLE_MAX_SECONDS = 90
 
 CSV_PATH = Path(__file__).parent / "contacts.csv"
 UNDO_FILE = Path(__file__).parent / ".undo_history.json"
@@ -71,8 +88,12 @@ STEP_TYPE = {
 def _write_default_config() -> None:
     """Generate a skeleton config.ini with current defaults."""
     CONFIG_FILE.write_text(
+        "[general]\n"
+        "# Send mode: manual = copy/paste emails yourself, auto = send via SMTP\n"
+        "send_mode = manual\n"
+        "\n"
         "[smtp]\n"
-        "# Office365 SMTP settings\n"
+        "# Office365 SMTP settings (only used when send_mode = auto)\n"
         "server = smtp.office365.com\n"
         "port = 587\n"
         "# Your Outlook email address\n"
@@ -80,7 +101,7 @@ def _write_default_config() -> None:
         "# Leave password blank — use OUTREACH_PASSWORD env var instead\n"
         "\n"
         "[limits]\n"
-        "# Max emails per day\n"
+        "# Max emails per day (only used when send_mode = auto)\n"
         "daily_email_limit = 150\n"
         "# Random throttle delay between emails (seconds)\n"
         "throttle_min_seconds = 30\n"
@@ -99,6 +120,9 @@ def _write_default_config() -> None:
 
 def load_config() -> None:
     """Load settings from config.ini, overriding hardcoded defaults."""
+    global SEND_MODE
+    global SMTP_SERVER, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD
+    global DAILY_EMAIL_LIMIT, THROTTLE_MIN_SECONDS, THROTTLE_MAX_SECONDS
     global STEP_WAIT_DAYS
 
     if not CONFIG_FILE.exists():
@@ -107,6 +131,27 @@ def load_config() -> None:
 
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_FILE)
+
+    if "general" in cfg:
+        # Env var takes priority over config file
+        if not os.environ.get("OUTREACH_SEND_MODE"):
+            mode = cfg["general"].get("send_mode", SEND_MODE).strip().lower()
+            if mode in ("manual", "auto"):
+                SEND_MODE = mode
+
+    if "smtp" in cfg:
+        SMTP_SERVER = cfg["smtp"].get("server", SMTP_SERVER)
+        SMTP_PORT = cfg["smtp"].getint("port", SMTP_PORT)
+        # Env vars take priority over config file for credentials
+        if not SMTP_EMAIL:
+            SMTP_EMAIL = cfg["smtp"].get("email", "") or SMTP_EMAIL
+        if not SMTP_PASSWORD:
+            SMTP_PASSWORD = cfg["smtp"].get("password", "") or SMTP_PASSWORD
+
+    if "limits" in cfg:
+        DAILY_EMAIL_LIMIT = cfg["limits"].getint("daily_email_limit", DAILY_EMAIL_LIMIT)
+        THROTTLE_MIN_SECONDS = cfg["limits"].getint("throttle_min_seconds", THROTTLE_MIN_SECONDS)
+        THROTTLE_MAX_SECONDS = cfg["limits"].getint("throttle_max_seconds", THROTTLE_MAX_SECONDS)
 
     if "cadence" in cfg:
         for key, val in cfg["cadence"].items():
@@ -118,12 +163,20 @@ def show_settings() -> None:
     """Display current active settings."""
     cprint("\n── CURRENT SETTINGS ──\n", Fore.CYAN)
     cprint(f"  Config file  : {CONFIG_FILE}", Fore.WHITE)
-    cprint(f"  Mode         : Manual send (no auto-send)", Fore.YELLOW)
+    mode_color = Fore.GREEN if SEND_MODE == "auto" else Fore.YELLOW
+    mode_desc = "auto (SMTP sending)" if SEND_MODE == "auto" else "manual (copy & paste)"
+    cprint(f"  Send mode    : {mode_desc}", mode_color)
+    if SEND_MODE == "auto":
+        cprint(f"  SMTP server  : {SMTP_SERVER}:{SMTP_PORT}", Fore.WHITE)
+        cprint(f"  Email        : {SMTP_EMAIL or '(not set)'}", Fore.WHITE)
+        cprint(f"  Password     : {'(set)' if SMTP_PASSWORD else '(not set)'}", Fore.WHITE)
+        cprint(f"  Daily limit  : {DAILY_EMAIL_LIMIT} emails", Fore.WHITE)
+        cprint(f"  Throttle     : {THROTTLE_MIN_SECONDS}–{THROTTLE_MAX_SECONDS}s", Fore.WHITE)
     cprint(f"\n  Step wait days:", Fore.CYAN)
     for step, days in sorted(STEP_WAIT_DAYS.items()):
         stype = STEP_TYPE.get(step, "?").upper()
         cprint(f"    Step {step} ({stype:<8}): {days} days", Fore.WHITE)
-    cprint(f"\n  Edit {CONFIG_FILE.name} to change these settings.", Fore.YELLOW)
+    cprint(f"\n  To switch send mode: edit {CONFIG_FILE.name} or use --send-mode auto|manual", Fore.YELLOW)
 
 
 # ─────────────────────────── EMAIL TEMPLATES ──────────────────
@@ -428,6 +481,31 @@ def is_due(row: pd.Series, today: datetime) -> bool:
     return today >= due_date
 
 
+def connect_smtp() -> smtplib.SMTP:
+    """Connect and authenticate to Outlook SMTP."""
+    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    return server
+
+
+def send_email(server: smtplib.SMTP, to_addr: str, subject: str, body: str) -> None:
+    """Send a single plain‑text email."""
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    server.sendmail(SMTP_EMAIL, to_addr, msg.as_string())
+
+
+def throttle() -> None:
+    """Random sleep between emails to avoid triggering rate limits."""
+    delay = random.randint(THROTTLE_MIN_SECONDS, THROTTLE_MAX_SECONDS)
+    cprint(f"  Throttling {delay}s …", Fore.YELLOW)
+    time.sleep(delay)
 
 
 def email_exists(df: pd.DataFrame, email: str) -> bool:
@@ -576,40 +654,64 @@ def prompt_for_notes(df: pd.DataFrame, idx: int, step: int) -> pd.DataFrame:
 # ─────────────────────── CORE ACTIONS ─────────────────────────
 
 def handle_email_step(
+    server: "smtplib.SMTP | None",
     df: pd.DataFrame,
     idx: int,
-) -> tuple[pd.DataFrame, bool]:
-    """Display an email for manual sending. Returns updated df and success flag."""
+    emails_sent: int,
+) -> tuple[pd.DataFrame, int, bool]:
+    """Handle an email step. In auto mode, sends via SMTP. In manual mode, displays for copy/paste."""
     row = df.loc[idx]
     step = int(row["step"])
     display_notes_log(row["notes"])
     result = get_template_for_step(step, row["name"], row["company"], row["title"])
     if result is None:
         cprint(f"  No email template for step {step}; skipping.", Fore.RED)
-        return df, False
+        return df, emails_sent, False
 
     subject, body = result
 
-    # Show email for manual sending
-    cprint(f"\n  ┌─ COPY & SEND THIS EMAIL MANUALLY ─┐", Fore.YELLOW)
-    cprint(f"  To: {row['email']}", Fore.GREEN)
+    # Show the email content
+    if SEND_MODE == "manual":
+        cprint(f"\n  ┌─ COPY & SEND THIS EMAIL MANUALLY ─┐", Fore.YELLOW)
+    cprint(f"\n  To: {row['email']}", Fore.GREEN)
     cprint(f"  Subject: {subject}", Fore.GREEN)
     cprint(f"  {'─' * 40}", Fore.WHITE)
     for line in body.splitlines():
         cprint(f"  {line}", Fore.WHITE)
     cprint(f"  {'─' * 40}", Fore.WHITE)
-    cprint(f"  └─────────────────────────────────────┘", Fore.YELLOW)
+    if SEND_MODE == "manual":
+        cprint(f"  └─────────────────────────────────────┘", Fore.YELLOW)
 
-    confirm = input(f"{Fore.YELLOW}  Did you send this email? (y/n): {Style.RESET_ALL}").strip().lower()
+    if SEND_MODE == "manual":
+        confirm = input(f"{Fore.YELLOW}  Did you send this email? (y/n): {Style.RESET_ALL}").strip().lower()
+    else:
+        confirm = input(f"{Fore.YELLOW}  Send this email? (y/n): {Style.RESET_ALL}").strip().lower()
     if confirm != "y":
         cprint(f"  Skipped {row['name']}.", Fore.YELLOW)
-        return df, False
+        return df, emails_sent, False
 
+    # In auto send mode, actually send via SMTP
+    if SEND_MODE == "auto":
+        try:
+            send_email(server, row["email"], subject, body)
+        except smtplib.SMTPException as exc:
+            cprint(f"  SMTP error for {row['email']}: {exc}", Fore.RED)
+            df.at[idx, "last_error"] = f"{datetime.now().strftime('%Y-%m-%d %H:%M')} {exc}"
+            save_contacts(df)
+            return df, emails_sent, False
+
+    emails_sent += 1
     df.at[idx, "last_error"] = ""
-    cprint(
-        f"  ✓ Marked as sent — {row['name']} ({row['email']}) — Step {step}",
-        Fore.GREEN,
-    )
+    if SEND_MODE == "manual":
+        cprint(
+            f"  ✓ Marked as sent — {row['name']} ({row['email']}) — Step {step}",
+            Fore.GREEN,
+        )
+    else:
+        cprint(
+            f"  ✓ Email sent to {row['name']} ({row['email']}) — Step {step}",
+            Fore.GREEN,
+        )
 
     # Save undo snapshot before advancing
     save_undo(df, idx, f"Email Step {step} to {row['name']}")
@@ -624,7 +726,7 @@ def handle_email_step(
     df.at[idx, "last_contact_date"] = today_str
     save_contacts(df)
     df = prompt_for_notes(df, idx, step)
-    return df, True
+    return df, emails_sent, True
 
 
 def handle_manual_step(df: pd.DataFrame, idx: int) -> pd.DataFrame:
@@ -871,6 +973,7 @@ def review_and_run(df: pd.DataFrame, dry_run: bool = False) -> pd.DataFrame:
     cprint(f"║  Follow‑up Emails  : {fu_email_count:>4}            ║", Fore.WHITE)
     cprint(f"║  Manual Tasks      : {fu_manual_count:>4}            ║", Fore.WHITE)
     cprint(f"║  New Outreach      : {new_email_count:>4}            ║", Fore.WHITE)
+    cprint(f"║  Daily Email Limit : {DAILY_EMAIL_LIMIT:>4}            ║", Fore.YELLOW)
     cprint(f"║  Total Actions     : {total:>4}            ║", Fore.WHITE)
     cprint("╚══════════════════════════════════════╝", Fore.CYAN)
 
@@ -914,19 +1017,43 @@ def review_and_run(df: pd.DataFrame, dry_run: bool = False) -> pd.DataFrame:
         cprint("  Cancelled.", Fore.RED)
         return df
 
-    emails_marked = 0
+    # ── Acquire SMTP credentials if emails are due (auto mode only) ──
+    smtp_server = None
+    emails_needed = fu_email_count + new_email_count
+    if SEND_MODE == "auto" and emails_needed > 0:
+        email_addr, password = get_credentials()
+        if not email_addr or not password:
+            cprint("  Cannot send emails without credentials. Aborting.", Fore.RED)
+            return df
+        try:
+            cprint("\n  Connecting to SMTP …", Fore.YELLOW)
+            smtp_server = connect_smtp()
+            cprint("  Connected.\n", Fore.GREEN)
+        except Exception as exc:
+            cprint(f"  SMTP connection failed: {exc}", Fore.RED)
+            return df
+
+    emails_sent = 0
     action_num = 0
 
     # ── Phase 1: Follow‑up emails (highest priority) ──
+    email_label = "FOLLOW‑UP EMAILS" if SEND_MODE == "auto" else "FOLLOW‑UP EMAILS (copy & send manually)"
     if fu_email_count > 0:
-        cprint("\n── FOLLOW‑UP EMAILS (copy & send manually) ──", Fore.CYAN)
+        cprint(f"\n── {email_label} ──", Fore.CYAN)
     for idx in buckets["followup_emails"]:
+        if SEND_MODE == "auto" and emails_sent >= DAILY_EMAIL_LIMIT:
+            cprint(
+                f"\n  Daily email limit ({DAILY_EMAIL_LIMIT}) reached during follow‑ups. "
+                "Stopping all emails for today.",
+                Fore.RED,
+            )
+            break
         action_num += 1
         row = df.loc[idx]
         cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
-        df, ok = handle_email_step(df, idx)
-        if ok:
-            emails_marked += 1
+        df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
+        if ok and SEND_MODE == "auto" and emails_sent < DAILY_EMAIL_LIMIT:
+            throttle()
 
     # ── Phase 2: Manual follow‑up tasks ──
     if fu_manual_count > 0:
@@ -938,20 +1065,70 @@ def review_and_run(df: pd.DataFrame, dry_run: bool = False) -> pd.DataFrame:
         df = handle_manual_step(df, idx)
 
     # ── Phase 3: New outreach emails (lowest priority) ──
-    if new_email_count > 0:
-        cprint("\n── NEW OUTREACH EMAILS (copy & send manually) ──", Fore.CYAN)
-    for idx in buckets["new_emails"]:
-        action_num += 1
-        row = df.loc[idx]
-        cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
-        df, ok = handle_email_step(df, idx)
-        if ok:
-            emails_marked += 1
+    if SEND_MODE == "auto":
+        limit_hit = emails_sent >= DAILY_EMAIL_LIMIT
+        if limit_hit:
+            cprint(
+                f"\n  Skipping {new_email_count} new‑outreach emails — daily limit reached.",
+                Fore.YELLOW,
+            )
+        else:
+            if new_email_count > 0:
+                cprint("\n── NEW OUTREACH EMAILS ──", Fore.CYAN)
+            for idx in buckets["new_emails"]:
+                if emails_sent >= DAILY_EMAIL_LIMIT:
+                    remaining = len(buckets["new_emails"]) - buckets["new_emails"].index(idx)
+                    cprint(
+                        f"\n  Daily limit reached. {remaining} new emails deferred to tomorrow.",
+                        Fore.YELLOW,
+                    )
+                    break
+                action_num += 1
+                row = df.loc[idx]
+                cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
+                df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
+                if ok and emails_sent < DAILY_EMAIL_LIMIT:
+                    throttle()
+    else:
+        new_label = "NEW OUTREACH EMAILS (copy & send manually)"
+        if new_email_count > 0:
+            cprint(f"\n── {new_label} ──", Fore.CYAN)
+        for idx in buckets["new_emails"]:
+            action_num += 1
+            row = df.loc[idx]
+            cprint(f"\n  [{action_num}/{total}] {row['name']} — {row['company']} (Step {int(row['step'])})", Fore.CYAN)
+            df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
 
-    cprint(f"\n  Session complete. Emails marked as sent: {emails_marked}", Fore.GREEN)
+    # ── Cleanup ──
+    if smtp_server:
+        try:
+            smtp_server.quit()
+        except Exception:
+            pass
+
+    sent_label = "Emails sent" if SEND_MODE == "auto" else "Emails marked as sent"
+    cprint(f"\n  Session complete. {sent_label} today: {emails_sent}", Fore.GREEN)
     return df
 
 
+# ──────────────────── CREDENTIALS ─────────────────────────────
+
+def get_credentials() -> tuple[str, str]:
+    """Return (email, password) from env vars or prompt."""
+    global SMTP_EMAIL, SMTP_PASSWORD
+
+    if SMTP_EMAIL and SMTP_PASSWORD:
+        return SMTP_EMAIL, SMTP_PASSWORD
+
+    cprint("\n  SMTP credentials not found in environment.", Fore.YELLOW)
+    cprint("  Set OUTREACH_EMAIL and OUTREACH_PASSWORD env vars, or enter below.\n", Fore.YELLOW)
+
+    if not SMTP_EMAIL:
+        SMTP_EMAIL = input("  Outlook email: ").strip()
+    if not SMTP_PASSWORD:
+        SMTP_PASSWORD = getpass("  Outlook password: ")
+
+    return SMTP_EMAIL, SMTP_PASSWORD
 
 
 # ──────────────────── STATUS DASHBOARD ────────────────────────
@@ -1409,26 +1586,59 @@ def _contact_untag(df: pd.DataFrame, arg: str) -> pd.DataFrame:
 # ──────────────────── RETRY FAILED EMAILS ─────────────────────
 
 def retry_failed(df: pd.DataFrame) -> pd.DataFrame:
-    """Show contacts with previous errors and offer to clear or re-queue them."""
+    """Re‑attempt or clear all emails that previously failed."""
     failed = df[df["last_error"].astype(str).str.strip() != ""]
     if failed.empty:
         cprint("\n  No failed emails to retry.", Fore.GREEN)
         return df
 
-    cprint(f"\n── PREVIOUSLY FAILED EMAILS ({len(failed)} contacts) ──\n", Fore.CYAN)
+    cprint(f"\n── FAILED EMAILS ({len(failed)} contacts) ──\n", Fore.CYAN)
     for idx, row in failed.iterrows():
         cprint(f"  [{idx}] {row['name']} ({row['email']}) — Error: {row['last_error']}", Fore.RED)
 
-    cprint("\n  These contacts had SMTP errors from before auto-send was removed.", Fore.YELLOW)
-    confirm = input(f"\n{Fore.YELLOW}  Type 'CLEAR' to clear all errors so they appear due again: {Style.RESET_ALL}").strip()
-    if confirm != "CLEAR":
+    if SEND_MODE == "manual":
+        cprint("\n  In manual mode — you can clear errors so these contacts show as due again.", Fore.YELLOW)
+        confirm = input(f"\n{Fore.YELLOW}  Type 'CLEAR' to clear all errors, or anything else to cancel: {Style.RESET_ALL}").strip()
+        if confirm != "CLEAR":
+            cprint("  Cancelled.", Fore.YELLOW)
+            return df
+        for idx in failed.index:
+            df.at[idx, "last_error"] = ""
+        save_contacts(df)
+        cprint(f"  Cleared errors for {len(failed)} contacts.", Fore.GREEN)
+        return df
+
+    # Auto send mode — retry via SMTP
+    confirm = input(f"\n{Fore.YELLOW}  Type 'GO' to retry all, or anything else to cancel: {Style.RESET_ALL}").strip()
+    if confirm != "GO":
         cprint("  Cancelled.", Fore.YELLOW)
         return df
 
+    email_addr, password = get_credentials()
+    if not email_addr or not password:
+        cprint("  Cannot send without credentials.", Fore.RED)
+        return df
+
+    try:
+        cprint("\n  Connecting to SMTP …", Fore.YELLOW)
+        smtp_server = connect_smtp()
+        cprint("  Connected.\n", Fore.GREEN)
+    except Exception as exc:
+        cprint(f"  SMTP connection failed: {exc}", Fore.RED)
+        return df
+
+    emails_sent = 0
     for idx in failed.index:
-        df.at[idx, "last_error"] = ""
-    save_contacts(df)
-    cprint(f"  Cleared errors for {len(failed)} contacts. They will show as due again.", Fore.GREEN)
+        df, emails_sent, ok = handle_email_step(smtp_server, df, idx, emails_sent)
+        if ok:
+            throttle()
+
+    try:
+        smtp_server.quit()
+    except Exception:
+        pass
+
+    cprint(f"\n  Retry complete. {emails_sent} emails sent.", Fore.GREEN)
     return df
 
 
@@ -1661,6 +1871,24 @@ def daily_recap(df: pd.DataFrame) -> None:
         cprint(f"  {line}", Fore.WHITE)
     cprint("", Fore.CYAN)
 
+    # Offer to email it (auto send mode only)
+    if SEND_MODE == "auto":
+        send_it = input(
+            f"\n{Fore.YELLOW}  Email this recap to yourself? (y/n): {Style.RESET_ALL}"
+        ).strip().lower()
+        if send_it == "y":
+            email_addr, password = get_credentials()
+            if not email_addr or not password:
+                cprint("  No credentials available.", Fore.RED)
+                return
+            try:
+                server = connect_smtp()
+                send_email(server, email_addr, f"Outreach Recap — {today_str}", recap_text)
+                server.quit()
+                cprint(f"  Recap sent to {email_addr}.", Fore.GREEN)
+            except Exception as exc:
+                cprint(f"  Failed to send recap: {exc}", Fore.RED)
+
 
 # ──────────────────── EXPORT ──────────────────────────────────
 
@@ -1754,6 +1982,7 @@ def demo_mode() -> None:
     cprint(f"║  Follow‑up Emails  : {len(fu_emails):>4}            ║", Fore.WHITE)
     cprint(f"║  Manual Tasks      : {len(manual):>4}            ║", Fore.WHITE)
     cprint(f"║  New Outreach      : {len(new_emails):>4}            ║", Fore.WHITE)
+    cprint(f"║  Daily Email Limit : {DAILY_EMAIL_LIMIT:>4}            ║", Fore.YELLOW)
     cprint(f"║  Total Actions     : {len(ordered):>4}            ║", Fore.WHITE)
     cprint("╚══════════════════════════════════════╝", Fore.CYAN)
 
@@ -1837,7 +2066,7 @@ def demo_mode() -> None:
     # ── Summary ──
     cprint(f"\n{'═' * 50}", Fore.GREEN)
     cprint(f"  DEMO COMPLETE", Fore.GREEN)
-    cprint(f"  In a real run, {len(fu_emails) + len(new_emails)} emails would be shown for you to copy & send.", Fore.GREEN)
+    cprint(f"  In a real run, {len(fu_emails) + len(new_emails)} emails would have been sent.", Fore.GREEN)
     cprint(f"  {len(manual)} manual tasks would have been prompted.", Fore.GREEN)
     cprint(f"  Notes you entered would be saved to contacts.csv.", Fore.GREEN)
     cprint(f"{'═' * 50}\n", Fore.GREEN)
@@ -1862,15 +2091,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python outreach.py                 # interactive menu\n"
-            "  python outreach.py --dry-run       # preview without sending\n"
-            "  python outreach.py --auto          # headless run for cron\n"
+            "  python outreach.py                          # interactive menu (manual mode)\n"
+            "  python outreach.py --send-mode auto         # interactive with SMTP sending\n"
+            "  python outreach.py --dry-run                # preview without sending\n"
+            "  python outreach.py --auto                   # headless run for cron\n"
+            "  python outreach.py --auto --send-mode auto  # headless + SMTP sending\n"
         ),
     )
     p.add_argument(
         "--auto",
         action="store_true",
-        help="Headless mode: list all due actions as reminders (for cron/scheduler)",
+        help="Headless mode for cron/scheduler",
     )
     p.add_argument(
         "--dry-run",
@@ -1878,14 +2109,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Preview today's actions without sending or saving anything",
     )
+    p.add_argument(
+        "--send-mode",
+        dest="send_mode",
+        choices=["manual", "auto"],
+        default=None,
+        help="Override send mode: 'manual' (copy/paste) or 'auto' (SMTP). Default: manual",
+    )
     return p.parse_args()
 
 
 def auto_run(df: pd.DataFrame) -> None:
     """Non-interactive cadence run for cron/scheduler use.
 
-    Lists all due email and manual steps as reminders.
+    In auto send mode: sends all due email steps automatically within the daily limit.
+    In manual send mode: lists all due actions as reminders (no SMTP needed).
     Prints structured log lines suitable for >> auto.log redirection.
+    Manual steps (call/SMS/LinkedIn) are printed as reminders and skipped.
     """
     load_config()
     ts = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
@@ -1899,11 +2139,31 @@ def auto_run(df: pd.DataFrame) -> None:
         return
 
     print(
-        f"[{ts()}] Starting auto-run: "
-        f"{len(email_indices)} email(s) to send manually, {len(manual_indices)} manual reminder(s)."
+        f"[{ts()}] Starting auto-run (send_mode={SEND_MODE}): "
+        f"{len(email_indices)} email(s), {len(manual_indices)} manual reminder(s)."
     )
 
+    # ── Auto send mode: connect SMTP and send ──
+    smtp = None
+    if SEND_MODE == "auto":
+        if not SMTP_EMAIL or not SMTP_PASSWORD:
+            print(
+                f"[{ts()}] ERROR: Credentials not set. "
+                "Export OUTREACH_EMAIL and OUTREACH_PASSWORD before running --auto with send_mode=auto."
+            )
+            sys.exit(1)
+        try:
+            smtp = connect_smtp()
+            print(f"[{ts()}] SMTP connected.")
+        except Exception as exc:
+            print(f"[{ts()}] ERROR SMTP connection failed: {exc}")
+            sys.exit(1)
+
+    emails_sent = 0
     for idx in email_indices:
+        if SEND_MODE == "auto" and emails_sent >= DAILY_EMAIL_LIMIT:
+            print(f"[{ts()}] Daily limit ({DAILY_EMAIL_LIMIT}) reached. Stopping emails.")
+            break
         row = df.loc[idx]
         step = int(row["step"])
         result = get_template_for_step(step, row["name"], row["company"], row["title"])
@@ -1911,8 +2171,29 @@ def auto_run(df: pd.DataFrame) -> None:
             print(f"[{ts()}] SKIP  Step {step} has no template — {row['name']}")
             continue
         subject, body = result
-        print(f"[{ts()}] TODO  Email Step {step} → {row['name']} <{row['email']}>")
-        print(f"        Subject: {subject}")
+
+        if SEND_MODE == "manual":
+            print(f"[{ts()}] TODO  Email Step {step} → {row['name']} <{row['email']}>")
+            print(f"        Subject: {subject}")
+        else:
+            try:
+                save_undo(df, idx, f"[AUTO] Email Step {step} to {row['name']}")
+                send_email(smtp, row["email"], subject, body)
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                df.at[idx, "last_contact_date"] = today_str
+                df.at[idx, "last_error"] = ""
+                if step >= 6:
+                    df.at[idx, "status"] = "finished"
+                else:
+                    df.at[idx, "step"] = step + 1
+                save_contacts(df)
+                emails_sent += 1
+                print(f"[{ts()}] SENT  Step {step} → {row['name']} <{row['email']}>")
+                throttle()
+            except smtplib.SMTPException as exc:
+                df.at[idx, "last_error"] = str(exc)
+                save_contacts(df)
+                print(f"[{ts()}] ERROR {row['email']}: {exc}")
 
     for idx in manual_indices:
         row = df.loc[idx]
@@ -1923,7 +2204,16 @@ def auto_run(df: pd.DataFrame) -> None:
             f"{row['name']} ({row['company']}) — {row['phone']}"
         )
 
-    print(f"[{ts()}] Done. {len(email_indices)} emails to send manually, {len(manual_indices)} manual tasks.")
+    if smtp:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+
+    if SEND_MODE == "manual":
+        print(f"[{ts()}] Done. {len(email_indices)} emails to send manually, {len(manual_indices)} manual tasks.")
+    else:
+        print(f"[{ts()}] Done. Emails sent this run: {emails_sent}.")
 
 
 # ──────────────────── MAIN MENU ───────────────────────────────
@@ -1941,9 +2231,9 @@ def main_menu() -> None:
 
     while True:
         cprint("\n── MAIN MENU ──", Fore.CYAN)
-        cprint("  1.  Run today's cadence (manual send)", Fore.WHITE)
+        cprint("  1.  Run today's cadence", Fore.WHITE)
         cprint("  2.  Dry-run (preview with real data)", Fore.WHITE)
-        cprint("  3.  Clear failed email errors", Fore.WHITE)
+        cprint("  3.  Retry failed emails", Fore.WHITE)
         cprint(f"  {'─' * 35}", Fore.WHITE)
         cprint("  4.  Who's due today?", Fore.WHITE)
         cprint("  5.  Search / Edit / Delete contacts", Fore.WHITE)
@@ -2003,6 +2293,9 @@ def main_menu() -> None:
 
 if __name__ == "__main__":
     args = parse_args()
+    # CLI --send-mode overrides env var and config file
+    if args.send_mode:
+        SEND_MODE = args.send_mode
     if args.auto:
         auto_run(load_contacts())
     elif args.dry_run:
