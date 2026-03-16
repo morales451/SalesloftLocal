@@ -1011,9 +1011,9 @@ def review_and_run(df: pd.DataFrame, dry_run: bool = False) -> pd.DataFrame:
 
     # ── Live run ──
     confirm = input(
-        f"\n{Fore.YELLOW}  Type 'GO' to start, or anything else to cancel: {Style.RESET_ALL}"
-    ).strip()
-    if confirm != "GO":
+        f"\n{Fore.YELLOW}  Press Enter to start, or type 'q' to cancel: {Style.RESET_ALL}"
+    ).strip().lower()
+    if confirm == "q":
         cprint("  Cancelled.", Fore.RED)
         return df
 
@@ -1684,8 +1684,8 @@ def retry_failed(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # Auto send mode — retry via SMTP
-    confirm = input(f"\n{Fore.YELLOW}  Type 'GO' to retry all, or anything else to cancel: {Style.RESET_ALL}").strip()
-    if confirm != "GO":
+    confirm = input(f"\n{Fore.YELLOW}  Press Enter to retry all, or type 'q' to cancel: {Style.RESET_ALL}").strip().lower()
+    if confirm == "q":
         cprint("  Cancelled.", Fore.YELLOW)
         return df
 
